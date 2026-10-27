@@ -267,7 +267,8 @@ class DistributedBackend(ExpertBackend):
                    "experts": len(self.plan.per_node.get(c.node_id, [])),
                    "requests": c.requests, "mib_out": c.bytes_out / 2**20, "wait_s": c.wait_s,
                    "compute_s": c.remote_s, "budget_bytes": c.info.get("budget_bytes"),
-                   "cpus": c.info.get("cpus"), "resident_bytes": c.resident_bytes}
+                   "cpus": c.info.get("cpus"), "resident_bytes": c.resident_bytes,
+                   "kernels": c.info.get("kernels")}
             out.append(row)
         out.append({"node": LOCAL, "address": "-", "alive": True,
                     "experts": len(self.plan.per_node.get(LOCAL, [])),

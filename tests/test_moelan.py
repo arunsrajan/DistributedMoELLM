@@ -526,3 +526,39 @@ def test_deepseek_distributed(deepseek, tmp_path):
         backend.close()
     finally:
         w1.kill(), w2.kill()
+
+
+# --- native 16-bit dense weights and the fused expert layer ------------------------
+
+from moelan import kernels as _kernels
+from moelan.experts import Half16
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+@pytest.mark.parametrize("rows", [1, 5, 40])
+def test_half16_matmul_is_exact(bf16, rows):
+    rng = np.random.default_rng(rows)
+    w = rng.standard_normal((70, 96)).astype(np.float32)
+    if bf16:
+        from moelan.safetensors_io import f32_to_bf16
+        bits = f32_to_bf16(w)
+    else:
+        w[0, :4] = [6e-8, -3e-6, 0.0, -0.0]          # half subnormals and signed zeros
+        bits = w.astype(np.float16).view(np.uint16)
+    m = Half16(bits, bf16)
+    W = m.dequant()
+    x = rng.standard_normal((rows, 96)).astype(np.float32)
+    np.testing.assert_allclose(m.matmul_t(x), x @ W.T, rtol=1e-5, atol=1e-5)
+    if not bf16:
+        np.testing.assert_array_equal(W, bits.view(np.float16).astype(np.float32))
+
+
+def test_dense_formats_agree(tiny):
+    toks = [256] + list(b"formats")
+    ref = None
+    for fmt in ("f32", "f16"):
+        m = MoEModel(tiny, dense_format=fmt)
+        out = m.forward(toks, m.new_cache())
+        if ref is None:
+            ref = out
+        np.testing.assert_allclose(out, ref, atol=1e-4)  # bf16-stored weights: f16 path is exact

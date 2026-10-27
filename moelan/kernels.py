@@ -16,6 +16,7 @@ import os
 import numpy as np
 
 ENABLED = False
+WHY_DISABLED = ""
 MAX_ROWS = 1 << 30  # all sizes go through the kernels
 ROW_DECODE_FROM = 4  # from this many input rows, decode each weight row once
 
@@ -24,7 +25,28 @@ if os.environ.get("MOELAN_KERNELS", "1") != "0":
         from numba import njit, prange
         ENABLED = True
     except ImportError:  # pragma: no cover - depends on the environment
-        pass
+        WHY_DISABLED = "numba is not installed for this Python"
+else:
+    WHY_DISABLED = "MOELAN_KERNELS=0"
+
+
+def warn_if_slow(stream=None) -> bool:
+    """Print a loud notice when the compiled kernels are off. Returns True if so."""
+    if ENABLED:
+        return False
+    import sys
+    stream = stream or sys.stderr
+    v = "%d.%d" % sys.version_info[:2]
+    bar = "!" * 78
+    print(f"""{bar}
+ moelan is running WITHOUT its compiled kernels ({WHY_DISABLED}, Python {v}).
+ The pure-numpy fallback is about 10x slower: roughly 0.3 tokens/s on
+ Qwen3-30B-A3B instead of 3-5. Use a Python that numba supports (3.10 - 3.13):
+     py -3.12 -m venv .venv312
+     .venv312\\Scripts\\python -m pip install -e ".[fast,hf]"
+     .venv312\\Scripts\\python -m moelan ...
+{bar}""", file=stream, flush=True)
+    return True
 
 if ENABLED:
     @njit(parallel=True, fastmath=True, cache=True, nogil=True)
@@ -44,8 +66,8 @@ if ENABLED:
                     part = np.float32(0.0)
                     b0 = g * half
                     for k in range(half):
-                        b = raw[o, b0 + k] ^ xor
-                        part += np.float32(b & 15) * xe[r, b0 + k] + np.float32(b >> 4) * xo[r, b0 + k]
+                        b = np.int32(raw[o, b0 + k] ^ xor)  # int32: the u8 -> f32 widening vectorizes
+                        part += np.float32(b & np.int32(15)) * xe[r, b0 + k] + np.float32(b >> np.int32(4)) * xo[r, b0 + k]
                     acc += part * s[o, g]
                 y[r, o] = acc
         return y
@@ -65,9 +87,9 @@ if ENABLED:
             for g in range(ng):
                 sc = s[o, g]
                 for k in range(half):
-                    b = raw[o, g * half + k] ^ xor
-                    w[g * half + k] = np.float32(np.int32(b & 15) - 8) * sc
-                    w[H + g * half + k] = np.float32(np.int32(b >> 4) - 8) * sc
+                    b = np.int32(raw[o, g * half + k] ^ xor)
+                    w[g * half + k] = np.float32((b & np.int32(15)) - np.int32(8)) * sc
+                    w[H + g * half + k] = np.float32((b >> np.int32(4)) - np.int32(8)) * sc
             for r in range(n):
                 acc = np.float32(0.0)
                 for i in range(I):
@@ -125,6 +147,41 @@ if ENABLED:
                     acc += w[o, i] * x[r, i]
                 y[r, o] = acc
         return y
+
+
+    @njit(parallel=True, fastmath=True, cache=True, nogil=True)
+    def _h16(x, bits, bf16):
+        # 16-bit weights as stored, widened to f32 one row at a time (exactly)
+        # and dotted with every input row. IEEE half: put exponent+mantissa in
+        # the f32 position and multiply by 2^112, which rebiases normals and
+        # turns half subnormals into the right normal f32 - branch-free, so
+        # the loops vectorize. bfloat16 is just the top half of an f32.
+        n, I = x.shape
+        O = bits.shape[0]
+        y = np.empty((n, O), np.float32)
+        rebias = np.float32(5.192296858534828e33)  # 2^112
+        for o in prange(O):
+            wf = np.empty(I, np.float32)
+            wu = wf.view(np.uint32)
+            if bf16:
+                for i in range(I):
+                    wu[i] = np.uint32(bits[o, i]) << 16
+            else:
+                for i in range(I):
+                    h = np.uint32(bits[o, i])
+                    wu[i] = ((h & 0x7FFF) << 13) | ((h & 0x8000) << 16)
+                for i in range(I):
+                    wf[i] = wf[i] * rebias
+            for r in range(n):
+                acc = np.float32(0.0)
+                for i in range(I):
+                    acc += wf[i] * x[r, i]
+                y[r, o] = acc
+        return y
+
+def h16_matmul_t(x: np.ndarray, bits: np.ndarray, bf16: bool) -> np.ndarray:
+    """x @ W.T for W stored as 16-bit floats (uint16 bits), decoded exactly."""
+    return _h16(np.ascontiguousarray(x, np.float32), bits, bf16)
 
 
 def f32_matmul_t(x: np.ndarray, w: np.ndarray) -> np.ndarray:

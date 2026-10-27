@@ -22,9 +22,10 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--expert-format", choices=["f32", "int8", "int4"], default=None,
                    help="how resident experts are kept in RAM: f32 (fastest, most RAM), int8, "
                         "int4 (least RAM, slowest). Default: int8 for int4 checkpoints, f32 otherwise")
-    p.add_argument("--dense-format", choices=["f32", "int8"], default="f32",
-                   help="attention/output-head weights on the coordinator: f32 (faithful) or "
-                        "int8 group-quantized like colibri's default (about 2x faster decode)")
+    p.add_argument("--dense-format", choices=["auto", "f32", "f16", "int8"], default="auto",
+                   help="attention/output-head weights on the coordinator: f16 = as stored, exact "
+                        "(default with numba), f32 (default without), int8 = group-quantized like "
+                        "colibri's default (fastest, not exact)")
     p.add_argument("--wire", choices=["f32", "f16"], default="f32",
                    help="activation precision on the network (f16 halves traffic)")
     p.add_argument("--no-replicate", action="store_true", help="do not replicate hot experts")
@@ -35,12 +36,14 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
 
 
 def build_model(args):
+    from . import kernels
     from .config import load_config
     from .coordinator import DistributedBackend
     from .discovery import discover
     from .model import MoEModel, load_heat
     from .worker import parse_size
 
+    kernels.warn_if_slow()
     workers = [w.strip() for w in args.workers.split(",") if w.strip()]
     if args.discover:
         print(f"discovering workers for {args.discover:.0f}s ...")
@@ -69,7 +72,9 @@ def build_model(args):
 
 
 def cmd_worker(args) -> None:
+    from . import kernels
     from .worker import parse_size, serve
+    kernels.warn_if_slow()
     serve(host=args.host, port=args.port, budget=parse_size(args.budget, None) if args.budget else None,
           cache_root=args.cache, model_dir=args.model, node_id=args.name,
           advertise=not args.no_advertise, lru_size=args.lru, threads=args.threads)
@@ -198,6 +203,11 @@ def cmd_make_tiny(args) -> None:
 
 
 def main(argv=None) -> None:
+    for stream in (sys.stdout, sys.stderr):  # a cp1252 console must not crash on model output
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(prog="moelan",
                                  description="Distribute Mixture-of-Experts LLM inference over a LAN.")
     ap.add_argument("--version", action="version", version=__version__)

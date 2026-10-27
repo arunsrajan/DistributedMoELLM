@@ -18,8 +18,8 @@ import numpy as np
 
 from . import kernels
 from .config import ModelConfig, load_config
-from .experts import (CheckpointSource, ExpertStore, GroupQuant, default_format, expert_ffn,
-                      resident_bytes)
+from .experts import (CheckpointSource, ExpertStore, GroupQuant, Half16, default_format,
+                      expert_ffn, resident_bytes)
 from .safetensors_io import SafeTensorDir
 
 
@@ -259,19 +259,32 @@ class KVCache:
 class MoEModel:
     def __init__(self, model_dir: str | Path, backend: ExpertBackend | None = None,
                  lru_size: int = 0, expert_format: str | None = None, pin_budget: int = 0,
-                 heat: Counter | None = None, progress=None, dense_format: str = "f32"):
+                 heat: Counter | None = None, progress=None, dense_format: str = "auto"):
         self.model_dir = Path(model_dir)
         self.cfg = cfg = load_config(model_dir)
+        if dense_format == "auto":  # stored 16-bit is exact and halves traffic, with the kernels
+            dense_format = "f16" if kernels.ENABLED else "f32"
+        if dense_format not in ("f32", "f16", "int8"):
+            raise ValueError("dense_format must be auto, f32, f16 or int8")
         self.dense_format = dense_format
         st = self.st = SafeTensorDir(model_dir)
+
+        def big(name):
+            """A large dense matrix in the chosen format."""
+            if dense_format == "f16":
+                buf, tag, shape = st.raw(name)
+                if tag in ("F16", "BF16"):
+                    return Half16(np.frombuffer(buf, np.uint16).reshape(shape).copy(), tag == "BF16")
+            w = st.get(name)
+            return GroupQuant.quantize(w, 64) if dense_format == "int8" else w
 
         def opt(name):
             return st.get(name) if name in st else None
 
         self.embed = st.get("model.embed_tokens.weight", dtype=None)  # only rows are read: keep as stored
         self.norm = st.get("model.norm.weight")
-        self.lm_head = st.get("model.embed_tokens.weight") \
-            if cfg.tie_word_embeddings or "lm_head.weight" not in st else st.get("lm_head.weight")
+        self.lm_head = big("model.embed_tokens.weight"
+                           if cfg.tie_word_embeddings or "lm_head.weight" not in st else "lm_head.weight")
         if cfg.attention == "mla":
             self.rotary = Rotary(cfg.qk_rope_head_dim, cfg.rope_theta, cfg.rope_scaling, interleaved=True)
             self.softmax_scale = (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim) ** -0.5
@@ -288,15 +301,15 @@ class MoEModel:
             L = {
                 "in_norm": st.get(f"{p}.input_layernorm.weight"),
                 "post_norm": st.get(f"{p}.post_attention_layernorm.weight"),
-                "o": st.get(f"{a}.o_proj.weight"),
+                "o": big(f"{a}.o_proj.weight"),
             }
             if cfg.attention == "mla":
                 if cfg.q_lora_rank:
-                    L.update(q_a=st.get(f"{a}.q_a_proj.weight"), q_a_norm=st.get(f"{a}.q_a_layernorm.weight"),
-                             q_b=st.get(f"{a}.q_b_proj.weight"))
+                    L.update(q_a=big(f"{a}.q_a_proj.weight"), q_a_norm=st.get(f"{a}.q_a_layernorm.weight"),
+                             q_b=big(f"{a}.q_b_proj.weight"))
                 else:
-                    L["q"] = st.get(f"{a}.q_proj.weight")
-                L["kv_a"] = st.get(f"{a}.kv_a_proj_with_mqa.weight")
+                    L["q"] = big(f"{a}.q_proj.weight")
+                L["kv_a"] = big(f"{a}.kv_a_proj_with_mqa.weight")
                 L["kv_a_norm"] = st.get(f"{a}.kv_a_layernorm.weight")
                 # kv_b expands the latent into per-head keys and values; it is
                 # absorbed into the query and output instead (see _mla).
@@ -306,8 +319,8 @@ class MoEModel:
                 L["w_uv_t"] = np.ascontiguousarray(kv_b[:, cfg.qk_nope_head_dim:].transpose(0, 2, 1))  # (H, r, v)
             else:
                 L.update({
-                    "q": st.get(f"{a}.q_proj.weight"), "k": st.get(f"{a}.k_proj.weight"),
-                    "v": st.get(f"{a}.v_proj.weight"),
+                    "q": big(f"{a}.q_proj.weight"), "k": big(f"{a}.k_proj.weight"),
+                    "v": big(f"{a}.v_proj.weight"),
                     "qb": opt(f"{a}.q_proj.bias"), "kb": opt(f"{a}.k_proj.bias"), "vb": opt(f"{a}.v_proj.bias"),
                     "q_norm": opt(f"{a}.q_norm.weight"), "k_norm": opt(f"{a}.k_norm.weight"),
                 })
@@ -320,15 +333,7 @@ class MoEModel:
                     L["shared_gate"] = opt(sgate)
             else:
                 L["mlp"] = tuple(st.get(n) for n in cfg.dense_mlp_names(i))
-            if dense_format == "int8":
-                for name in ("q", "k", "v", "o", "q_a", "q_b", "kv_a"):
-                    if name in L:
-                        L[name] = GroupQuant.quantize(L[name], 64)
             self.layers.append(L)
-        if dense_format == "int8":  # colibri's default: about 4x less memory traffic per token
-            self.lm_head = GroupQuant.quantize(self.lm_head, 64)
-        elif dense_format != "f32":
-            raise ValueError("dense_format must be f32 or int8")
         if backend is None:
             fmt = expert_format or default_format(cfg)
             store = ExpertStore([CheckpointSource(model_dir, cfg)], fmt=fmt, lru_size=lru_size,

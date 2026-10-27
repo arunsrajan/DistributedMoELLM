@@ -80,6 +80,31 @@ class F32Matrix:
         return self.w.nbytes
 
 
+class Half16:
+    """A matrix kept in its stored 16-bit form (IEEE half or bfloat16 bits).
+    The kernels widen each row to f32 exactly while computing, so results equal
+    the f32 path with half the memory traffic."""
+
+    __slots__ = ("bits", "bf16")
+
+    def __init__(self, bits: np.ndarray, bf16: bool):
+        self.bits, self.bf16 = np.ascontiguousarray(bits, np.uint16), bf16
+
+    def dequant(self) -> np.ndarray:
+        if self.bf16:
+            return (self.bits.astype(np.uint32) << 16).view(np.float32)
+        return self.bits.view(np.float16).astype(np.float32)
+
+    def matmul_t(self, x):
+        if kernels.ENABLED and x.shape[0] <= 32:   # long prompts: widen once, then BLAS
+            return kernels.h16_matmul_t(x, self.bits, self.bf16)
+        return x @ self.dequant().T
+
+    @property
+    def nbytes(self):
+        return self.bits.nbytes
+
+
 class GroupQuant:
     """int8 values with one f32 scale per ``gs`` inputs of each output row."""
 
@@ -322,7 +347,6 @@ class CheckpointSource:
 
     def nbytes(self, key: ExpertKey) -> int:
         return sum(self.st.nbytes(n) for n in self.cfg.expert_names(*key))
-
 
 class CacheSource:
     """Experts a coordinator pushed over the network, one small file each."""

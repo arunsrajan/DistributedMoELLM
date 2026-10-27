@@ -115,7 +115,9 @@ class WorkerState:
             for d in self.cache_root.iterdir():
                 if d.is_dir():
                     cached[d.name] = sum(1 for _ in d.glob("L*_E*.safetensors"))
+        from . import kernels
         return {"node_id": self.node_id, "version": __version__, "protocol": PROTOCOL_VERSION,
+                "kernels": "numba" if kernels.ENABLED else "numpy",
                 "budget_bytes": self.budget, "cpus": os.cpu_count(), "cached": cached,
                 "local_model": self.local_fp}
 

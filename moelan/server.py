@@ -17,6 +17,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 
+from . import kernels
 from .model import MoEModel
 from .tokenizer import Tokenizer
 
@@ -100,7 +101,8 @@ def model_info(model: MoEModel, name: str) -> dict:
             "top_k": cfg.top_k, "hidden": cfg.hidden_size, "dense_bytes": model.dense_bytes(),
             "expert_format": getattr(b, "fmt", None) or (store.fmt if store else None),
             "dense_format": getattr(model, "dense_format", "f32"),
-            "backend": "distributed" if hasattr(b, "conns") else "local"}
+            "backend": "distributed" if hasattr(b, "conns") else "local",
+            "kernels": "numba" if kernels.ENABLED else "numpy"}
 
 
 def node_stats(model: MoEModel) -> list[dict]:

@@ -40,6 +40,7 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
 .pill.idle { background: var(--surface-2); color: var(--muted); }
 .pill.busy { background: var(--accent-soft); color: var(--accent); }
 .pill.down { background: var(--bad-soft); color: var(--bad); }
+.chip.warn { background: var(--warn-soft); color: var(--warn); border-color: transparent; font-weight: 600; }
 button.ghost { background: none; border: 1px solid var(--border); color: var(--muted);
   border-radius: 6px; padding: 3px 8px; cursor: pointer; font: inherit; font-size: 12px; }
 main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; display: grid; gap: 16px; }
@@ -223,6 +224,8 @@ function render() {
                      `${m.moe_layers} MoE layers × ${m.experts} experts, top-${m.top_k}`,
                      `experts ${m.expert_format}`, `dense ${m.dense_format} · ${gib(m.dense_bytes)}`, m.backend])
       chips.append(el("span", { class: "chip" }, t));
+    chips.append(m.kernels === "numba" ? el("span", { class: "chip" }, "numba kernels")
+      : el("span", { class: "chip warn", title: "Install numba in a Python it supports (3.10-3.13) for ~10x speed" }, "numpy fallback: slow"));
   } else chips.append(el("span", { class: "chip" }, "no model loaded: health of workers only"));
 
   const alive = s.nodes.filter(n => n.alive).length;
@@ -274,7 +277,8 @@ function renderNodes(nodes) {
     .map((h, i) => el("th", { class: i >= 3 && i < 10 && i !== 4 ? "num" : "" }, h)));
   const rows = nodes.map(n => {
     const ram = n.resident_bytes != null ? gib(n.resident_bytes) + (n.budget_bytes ? " / " + gib(n.budget_bytes) : "") : "–";
-    const extra = n.node === "local" ? `disk reads ${int(n.disk_reads)} · RAM hits ${int(n.hits)}` : (n.error || "");
+    const extra = n.node === "local" ? `disk reads ${int(n.disk_reads)} · RAM hits ${int(n.hits)}`
+      : n.kernels === "numpy" ? "numpy fallback: slow" : (n.error || "");
     return el("tr", {},
       el("td", {}, el("span", { class: "dot", style: `background:${nodeColor[n.node] || PALETTE[0]}` }), n.node),
       el("td", { class: "mono" }, n.address || "–"),

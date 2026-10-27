@@ -64,7 +64,7 @@ that already fits.
 * **Zero-config discovery.** Workers broadcast UDP beacons (port 47474);
   `--discover 3` finds them. `--workers host:port,...` works across subnets.
 * **Faithful by default.** f32 activations, the router's decisions unchanged.
-  Expert residency `--expert-format f32|int8|int4`, `--dense-format int8`
+  Expert residency `--expert-format f32|int8|int4`, `--dense-format f16|int8|f32`
   (colibri's default, ~1.5x faster decode), `--wire f16` (half the traffic).
 * **Reads colibri int4 containers directly** (`merged_weight` + `qs`,
   `qwen36_meta.json`), and uses colibri's `.coli_usage` routing statistics to
@@ -176,15 +176,22 @@ Laptop: Ryzen 5 5500U (6 cores / 12 threads), 32 GB, Wi-Fi. Decode, greedy,
 | Setup | tok/s |
 |---|---|
 | first version (numpy; a float64 promotion bug) | 0.04 |
-| pure numpy, Python 3.15, no numba | 0.25-0.30 |
-| numba kernels, f32 attention/head | 2.6 |
-| **numba kernels, int8 attention/head, 1 machine** | **3.7-3.9** |
+| pure numpy, no numba | 0.25-0.30 |
+| numba kernels, f32 attention/head (previous default) | 2.1-2.4 |
+| **numba kernels, attention/head as stored 16-bit (default, exact)** | **3.1-3.3** |
+| **numba kernels, `--dense-format int8`** | **3.5-3.9** |
 | coordinator + 1 worker process, same laptop | 2.5 |
 | coordinator + 2 worker processes, same laptop | 3.0 |
 | colibri (C/SIMD) on a similar CPU, its README | 8.5-13 |
 
-Where one token's 0.26 s goes on one machine: routed experts about 0.15-0.2 s
-(384 expert evaluations), attention + output head about 0.09 s. Loopback round
+Measured with the model files in the OS file cache and nothing else holding
+RAM. The 15 GB of experts are read through that cache, so on a 32 GB machine
+another large process (a second moelan server, a browser with many tabs)
+pushes experts out to disk and speed can halve.
+
+Where one token's ~0.3 s goes on one machine: routed experts about 0.17 s (384
+expert evaluations, numba's int4 kernels at roughly 8-12 GB/s), attention +
+output head about 0.13 s as 16-bit or 0.09 s as int8. Loopback round
 trip 0.08 ms; the full per-layer request/reply overhead is about 0.4 ms.
 
 **Does the LAN make it faster?** The workers on one laptop share the same six
