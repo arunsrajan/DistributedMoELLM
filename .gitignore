@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# virtual environments
+.venv*/
+venv/
+
+# test and tool caches
+.pytest_cache/
+graphify-out/
+
+# models and weights live outside the repository
+*.safetensors
+*.gguf

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moelan"
+version = "0.1.0"
+description = "Distribute Mixture-of-Experts LLM inference (expert parallelism) across laptops on a LAN"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+
+[project.optional-dependencies]
+hf = ["tokenizers>=0.15", "jinja2>=3"]
+fast = ["numba>=0.60"]   # compiled int4/int8 kernels: ~13x faster decode (needs a Python numba supports)
+dev = ["pytest>=7"]
+ref = ["torch>=2", "transformers>=4.57"]  # tests/test_hf_reference.py: compare against HF
+
+[project.scripts]
+moelan = "moelan.cli:main"
+
+[tool.setuptools]
+packages = ["moelan"]
+
+[tool.setuptools.package-data]
+moelan = ["dashboard.html"]

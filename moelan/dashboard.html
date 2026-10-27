@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>moelan cluster</title>
+<style>
+:root {
+  --bg: #f6f7f9; --surface: #ffffff; --surface-2: #f0f2f5; --border: #dfe3e8;
+  --text: #1b1f24; --muted: #5d6773; --accent: #2563eb; --accent-soft: #dbe6fd;
+  --ok: #15803d; --ok-soft: #dcfce7; --bad: #b91c1c; --bad-soft: #fee2e2;
+  --warn: #a16207; --warn-soft: #fef3c7; --heat: 37, 99, 235; --mark: #f97316;
+  --mono: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --surface: #171b21; --surface-2: #1e232b; --border: #2b323c;
+    --text: #e6e9ee; --muted: #98a2ae; --accent: #6ea0ff; --accent-soft: #1d2b47;
+    --ok: #4ade80; --ok-soft: #12301f; --bad: #f87171; --bad-soft: #3a1717;
+    --warn: #facc15; --warn-soft: #3a3010; --heat: 110, 160, 255; --mark: #fb923c;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --surface: #171b21; --surface-2: #1e232b; --border: #2b323c;
+  --text: #e6e9ee; --muted: #98a2ae; --accent: #6ea0ff; --accent-soft: #1d2b47;
+  --ok: #4ade80; --ok-soft: #12301f; --bad: #f87171; --bad-soft: #3a1717;
+  --warn: #facc15; --warn-soft: #3a3010; --heat: 110, 160, 255; --mark: #fb923c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--border); }
+.brand { font-weight: 700; font-size: 17px; letter-spacing: .2px; }
+.brand small { font-weight: 500; color: var(--muted); margin-left: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; }
+.chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2);
+  color: var(--muted); border: 1px solid var(--border); white-space: nowrap; }
+.pill { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px; }
+.pill.idle { background: var(--surface-2); color: var(--muted); }
+.pill.busy { background: var(--accent-soft); color: var(--accent); }
+.pill.down { background: var(--bad-soft); color: var(--bad); }
+button.ghost { background: none; border: 1px solid var(--border); color: var(--muted);
+  border-radius: 6px; padding: 3px 8px; cursor: pointer; font: inherit; font-size: 12px; }
+main { max-width: 1280px; margin: 0 auto; padding: 20px 24px 40px; display: grid; gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; min-width: 0; }
+.card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .5px; display: flex; align-items: center; gap: 10px; }
+.card h2 .spacer { flex: 1; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.kpi .label { font-size: 12px; color: var(--muted); }
+.kpi .value { font-size: 24px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.kpi .sub { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.row2 { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
+.row2b { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 860px) { .row2, .row2b { grid-template-columns: 1fr; } header, main { padding-left: 16px; padding-right: 16px; } }
+canvas { display: block; width: 100%; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+td.num, th.num { text-align: right; }
+tr:last-child td { border-bottom: none; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; vertical-align: 0; }
+.status-ok { color: var(--ok); } .status-bad { color: var(--bad); }
+.bar { height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden; min-width: 70px; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-variant-numeric: tabular-nums; }
+.kv dt { color: var(--muted); } .kv dd { margin: 0; text-align: right; font-weight: 600; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.seg button { background: none; border: 0; padding: 4px 10px; font: inherit; font-size: 12px; color: var(--muted); cursor: pointer; text-transform: none; letter-spacing: 0; }
+.seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin-top: 10px; }
+.map-wrap { position: relative; }
+.tip { position: absolute; pointer-events: none; background: var(--text); color: var(--bg);
+  font-size: 12px; padding: 5px 8px; border-radius: 6px; white-space: nowrap; display: none; z-index: 2; }
+.empty { color: var(--muted); padding: 18px 0; text-align: center; }
+.chat-log { height: 260px; overflow-y: auto; background: var(--surface-2); border-radius: 8px; padding: 10px 12px;
+  font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
+.chat-log .u { color: var(--accent); font-weight: 600; margin-top: 8px; }
+.chat-log .u:first-child { margin-top: 0; }
+.chat-log .a { margin-top: 4px; }
+.chat-form { display: flex; gap: 8px; margin-top: 10px; }
+.chat-form textarea { flex: 1; resize: vertical; min-height: 40px; font: inherit; padding: 8px 10px;
+  border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+.chat-form .side { display: flex; flex-direction: column; gap: 6px; }
+.chat-form input { width: 80px; font: inherit; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--surface); color: var(--text); }
+button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 8px 14px;
+  font: inherit; font-weight: 600; cursor: pointer; }
+button.primary:disabled { opacity: .5; cursor: default; }
+.muted { color: var(--muted); }
+.mono { font-family: var(--mono); font-size: 12px; }
+.err { color: var(--bad); font-size: 13px; margin-top: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">moelan<small id="mode">cluster</small></div>
+  <div class="chips" id="chips"></div>
+  <span class="pill idle" id="pill">connecting</span>
+  <button class="ghost" id="theme" title="Toggle light / dark">Theme</button>
+</header>
+<main>
+  <section class="kpis" id="kpis"></section>
+
+  <div class="row2">
+    <section class="card">
+      <h2>Throughput <span class="spacer"></span><span class="muted" style="text-transform:none;letter-spacing:0">tokens / s, last 2 min</span></h2>
+      <canvas id="chart" height="180"></canvas>
+    </section>
+    <section class="card">
+      <h2>Current request</h2>
+      <div id="active"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Nodes</h2>
+    <div class="table-wrap"><table id="nodes"></table></div>
+  </section>
+
+  <section class="card" id="mapCard">
+    <h2>Experts <span class="spacer"></span>
+      <span class="seg" id="mapMode"><button data-m="heat" class="on">Routing heat</button><button data-m="place">Placement</button></span>
+    </h2>
+    <div class="map-wrap"><canvas id="map"></canvas><div class="tip" id="tip"></div></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <div class="row2b">
+    <section class="card">
+      <h2>Recent requests</h2>
+      <div class="table-wrap"><table id="recent"></table></div>
+    </section>
+    <section class="card" id="chatCard">
+      <h2>Try it <span class="spacer"></span><button class="ghost" id="clear">Clear</button></h2>
+      <div class="chat-log" id="log"><span class="muted">Send a message to watch the experts fire.</span></div>
+      <form class="chat-form" id="chat">
+        <textarea id="msg" placeholder="Ask something…" rows="2"></textarea>
+        <div class="side">
+          <label class="muted" style="font-size:12px">max tokens<br><input id="maxtok" type="number" min="1" max="4096" value="128"></label>
+          <button class="primary" id="send" type="submit">Send</button>
+        </div>
+      </form>
+      <div class="err" id="chatErr"></div>
+    </section>
+  </div>
+</main>
+<script>
+"use strict";
+(() => {  // own scope: names like status/history would collide with window globals
+const $ = id => document.getElementById(id);
+const PALETTE = ["#64748b", "#2563eb", "#16a34a", "#d97706", "#9333ea", "#0891b2", "#db2777", "#65a30d", "#dc2626", "#7c3aed"];
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmt = (v, d = 1) => v == null || Number.isNaN(v) ? "–" : Number(v).toFixed(d);
+const gib = b => b == null ? "–" : (b / 2 ** 30).toFixed(2) + " GiB";
+const int = v => v == null ? "–" : Math.round(v).toLocaleString();
+function dur(s) {
+  if (s == null) return "–";
+  if (s < 60) return s.toFixed(0) + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m " + Math.floor(s % 60) + "s";
+  return Math.floor(s / 3600) + "h " + Math.floor(s % 3600 / 60) + "m";
+}
+function el(tag, attrs = {}, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "style") e.style.cssText = v; else e.setAttribute(k, v);
+  }
+  for (const k of kids) e.append(k instanceof Node ? k : document.createTextNode(k ?? ""));
+  return e;
+}
+
+// ---- theme ---------------------------------------------------------------
+try { const t = localStorage.getItem("moelan-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+$("theme").onclick = () => {
+  const dark = document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("moelan-theme", document.documentElement.dataset.theme); } catch (e) {}
+  drawChart(); drawMap();
+};
+
+// ---- state ---------------------------------------------------------------
+let status = null, heat = null, nodeColor = {}, mapMode = "heat";
+const series = [];          // [time, tok/s]
+const SERIES_S = 120;
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+async function pollStatus() {
+  try {
+    status = await getJSON("/api/status");
+    const now = Date.now() / 1000;
+    series.push([now, status.gen.rate_tok_s]);
+    while (series.length && now - series[0][0] > SERIES_S) series.shift();
+    render();
+  } catch (e) {
+    $("pill").className = "pill down"; $("pill").textContent = "server unreachable";
+  }
+  setTimeout(pollStatus, 1000);
+}
+async function pollHeat() {
+  if (status && status.mode === "serve") {
+    try { heat = await getJSON("/api/heat"); drawMap(); } catch (e) {}
+  }
+  setTimeout(pollHeat, status && status.gen.busy ? 700 : 2500);
+}
+
+// ---- rendering ------------------------------------------------------------
+function render() {
+  const s = status, g = s.gen, m = s.model;
+  $("mode").textContent = s.mode === "monitor" ? "worker monitor" : "cluster";
+  const chips = $("chips"); chips.replaceChildren();
+  if (m) {
+    for (const t of [m.name, m.family + (m.layout === "colibri_int4" ? " · colibri int4" : ""),
+                     `${m.moe_layers} MoE layers × ${m.experts} experts, top-${m.top_k}`,
+                     `experts ${m.expert_format}`, `dense ${m.dense_format} · ${gib(m.dense_bytes)}`, m.backend])
+      chips.append(el("span", { class: "chip" }, t));
+  } else chips.append(el("span", { class: "chip" }, "no model loaded: health of workers only"));
+
+  const alive = s.nodes.filter(n => n.alive).length;
+  const pill = $("pill");
+  if (alive < s.nodes.length) { pill.className = "pill down"; pill.textContent = `${s.nodes.length - alive} node(s) down`; }
+  else if (g.busy) { pill.className = "pill busy"; pill.textContent = g.active.phase === "prefill" ? "reading prompt" : "generating"; }
+  else { pill.className = "pill idle"; pill.textContent = "idle"; }
+
+  const last = g.recent[0];
+  const kpis = [
+    ["Speed now", fmt(g.rate_tok_s, 2), "tokens / s"],
+    ["Last request", last ? fmt(last.decode_tok_s, 2) : "–", last ? `decode tok/s · prefill ${fmt(last.prefill_s, 1)}s` : "decode tok/s"],
+    ["Tokens generated", int(g.tokens_out), `${int(g.tokens_in)} prompt tokens read`],
+    ["Requests", int(g.requests), g.busy ? "1 running" : "none running"],
+    ["Nodes", `${alive} / ${s.nodes.length}`, "alive"],
+    ["Uptime", dur(g.uptime_s), s.moe_time_s ? `experts busy ${dur(s.moe_time_s)}` : ""],
+  ];
+  if (s.mode === "monitor") kpis.splice(0, 4);
+  $("kpis").replaceChildren(...kpis.map(([l, v, sub]) =>
+    el("div", { class: "kpi" }, el("div", { class: "label" }, l), el("div", { class: "value" }, v), el("div", { class: "sub" }, sub))));
+
+  renderActive(g);
+  renderNodes(s.nodes);
+  renderRecent(g.recent);
+  drawChart();
+  $("mapCard").style.display = s.mode === "monitor" ? "none" : "";
+  $("chatCard").style.display = s.mode === "monitor" ? "none" : "";
+}
+
+function renderActive(g) {
+  const box = $("active");
+  if (!g.busy) { box.replaceChildren(el("div", { class: "empty" }, "No request running.")); return; }
+  const a = g.active;
+  const rows = [["Phase", a.phase], ["Prompt tokens", int(a.prompt_tokens)], ["Generated", int(a.generated)],
+                ["Elapsed", fmt(a.elapsed_s, 1) + " s"], ["Decode speed", a.decode_tok_s ? fmt(a.decode_tok_s, 2) + " tok/s" : "–"]];
+  box.replaceChildren(el("dl", { class: "kv" }, ...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)])),
+                      el("div", { class: "mono muted", style: "margin-top:10px" }, a.id));
+}
+
+function renderNodes(nodes) {
+  const t = $("nodes");
+  if (!nodes.length) { t.replaceChildren(el("tr", {}, el("td", { class: "empty" }, "No nodes yet."))); return; }
+  const names = heat ? heat.nodes : [];
+  nodes.forEach(n => { if (!(n.node in nodeColor)) nodeColor[n.node] = PALETTE[(names.indexOf(n.node) >= 0 ? names.indexOf(n.node) : Object.keys(nodeColor).length) % PALETTE.length]; });
+  // Workers compute in parallel; the coordinator collects replies in turn, so
+  // "waited" is time the coordinator spent blocked on that node specifically.
+  const maxBusy = Math.max(1e-9, ...nodes.map(n => n.compute_s || 0));
+  const head = el("tr", {}, ...["Node", "Address", "Status", "Experts", "RAM used / budget", "CPUs", "Requests", "MiB sent", "Worker compute (s)", "Coordinator waited (s)", ""]
+    .map((h, i) => el("th", { class: i >= 3 && i < 10 && i !== 4 ? "num" : "" }, h)));
+  const rows = nodes.map(n => {
+    const ram = n.resident_bytes != null ? gib(n.resident_bytes) + (n.budget_bytes ? " / " + gib(n.budget_bytes) : "") : "–";
+    const extra = n.node === "local" ? `disk reads ${int(n.disk_reads)} · RAM hits ${int(n.hits)}` : (n.error || "");
+    return el("tr", {},
+      el("td", {}, el("span", { class: "dot", style: `background:${nodeColor[n.node] || PALETTE[0]}` }), n.node),
+      el("td", { class: "mono" }, n.address || "–"),
+      el("td", { class: n.alive ? "status-ok" : "status-bad" }, n.alive ? "● up" : "● down"),
+      el("td", { class: "num" }, int(n.experts)),
+      el("td", {}, ram),
+      el("td", { class: "num" }, n.cpus ?? "–"),
+      el("td", { class: "num" }, n.requests != null ? int(n.requests) : "–"),
+      el("td", { class: "num" }, n.mib_out != null ? fmt(n.mib_out, 1) : "–"),
+      el("td", { class: "num" }, n.compute_s != null ? fmt(n.compute_s, 2) : "–"),
+      el("td", { class: "num" }, n.wait_s != null ? fmt(n.wait_s, 2) : "–"),
+      el("td", {}, n.compute_s != null ? el("div", { class: "bar", title: "compute time relative to the busiest node" }, el("i", { style: `width:${Math.min(100, 100 * n.compute_s / maxBusy)}%` })) : el("span", { class: "muted" }, extra)));
+  });
+  t.replaceChildren(head, ...rows);
+}
+
+function renderRecent(recent) {
+  const t = $("recent");
+  if (!recent.length) { t.replaceChildren(el("tr", {}, el("td", { class: "empty" }, "No requests yet."))); return; }
+  const head = el("tr", {}, ...["When", "Prompt", "Generated", "Prefill (s)", "Decode tok/s", "Total (s)"].map((h, i) => el("th", { class: i ? "num" : "" }, h)));
+  t.replaceChildren(head, ...recent.slice(0, 10).map(r => el("tr", {},
+    el("td", {}, new Date(r.ended * 1000).toLocaleTimeString()),
+    el("td", { class: "num" }, int(r.prompt_tokens)), el("td", { class: "num" }, int(r.completion_tokens)),
+    el("td", { class: "num" }, fmt(r.prefill_s, 2)), el("td", { class: "num" }, fmt(r.decode_tok_s, 2)),
+    el("td", { class: "num" }, fmt(r.total_s, 1)))));
+}
+
+function setupCanvas(c, h) {
+  const dpr = window.devicePixelRatio || 1, w = c.clientWidth;
+  c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); c.style.height = h + "px";
+  const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return [ctx, w];
+}
+
+function drawChart() {
+  const c = $("chart"), H = 180;
+  const [ctx, W] = setupCanvas(c, H);
+  const pad = { l: 34, r: 8, t: 8, b: 20 };
+  const now = Date.now() / 1000;
+  const ymax = Math.max(1, ...series.map(p => p[1])) * 1.15;
+  ctx.font = "11px system-ui"; ctx.fillStyle = css("--muted"); ctx.strokeStyle = css("--border"); ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = ymax * i / 4, y = pad.t + (H - pad.t - pad.b) * (1 - i / 4);
+    ctx.beginPath(); ctx.moveTo(pad.l, y + .5); ctx.lineTo(W - pad.r, y + .5); ctx.stroke();
+    ctx.fillText(v.toFixed(v < 10 ? 1 : 0), 4, y + 4);
+  }
+  for (const s of [120, 90, 60, 30, 0]) {
+    const x = pad.l + (W - pad.l - pad.r) * (1 - s / SERIES_S);
+    ctx.fillText(s ? `-${s}s` : "now", Math.min(x - 10, W - 26), H - 5);
+  }
+  if (series.length < 2) return;
+  const X = t => pad.l + (W - pad.l - pad.r) * (1 - (now - t) / SERIES_S);
+  const Y = v => pad.t + (H - pad.t - pad.b) * (1 - v / ymax);
+  ctx.beginPath();
+  series.forEach(([t, v], i) => i ? ctx.lineTo(X(t), Y(v)) : ctx.moveTo(X(t), Y(v)));
+  ctx.strokeStyle = css("--accent"); ctx.lineWidth = 2; ctx.stroke();
+  ctx.lineTo(X(series[series.length - 1][0]), Y(0)); ctx.lineTo(X(series[0][0]), Y(0)); ctx.closePath();
+  ctx.fillStyle = `rgba(${css("--heat")}, .12)`; ctx.fill();
+}
+
+// ---- expert map -------------------------------------------------------------
+let cell = { w: 0, h: 0, ox: 0, oy: 0 };
+function drawMap() {
+  if (!heat || !heat.layers) return;
+  const c = $("map"), L = heat.layers, E = heat.experts;
+  const W0 = c.clientWidth || 800;
+  const ox = 34, oy = 4, cw = Math.max(2, Math.floor((W0 - ox - 4) / E)), ch = Math.max(4, Math.min(12, cw + 1));
+  const H = oy + L * ch + 18;
+  const [ctx, W] = setupCanvas(c, H);
+  cell = { w: cw, h: ch, ox, oy };
+  const flat = heat.counts.flat(), max = Math.max(1, ...flat), lmax = Math.log1p(max);
+  const rgb = css("--heat"), surf = css("--surface-2");
+  for (let l = 0; l < L; l++) for (let e = 0; e < E; e++) {
+    const x = ox + e * cw, y = oy + l * ch;
+    if (mapMode === "heat") {
+      const v = heat.counts[l][e];
+      ctx.fillStyle = v ? `rgba(${rgb}, ${(0.12 + 0.88 * Math.log1p(v) / lmax).toFixed(3)})` : surf;
+    } else {
+      ctx.fillStyle = nodeColor[heat.nodes[heat.owners[l][e]]] || PALETTE[heat.owners[l][e] % PALETTE.length];
+    }
+    ctx.fillRect(x, y, cw - (cw > 3 ? 1 : 0), ch - 1);
+  }
+  ctx.strokeStyle = css("--mark"); ctx.lineWidth = 2;
+  for (const [l, ex] of Object.entries(heat.last)) for (const e of ex)
+    ctx.strokeRect(ox + e * cw + .5, oy + (+l) * ch + .5, Math.max(1, cw - 2), ch - 2);
+  ctx.fillStyle = css("--muted"); ctx.font = "10px system-ui";
+  for (let l = 0; l < L; l += Math.ceil(L / 12)) ctx.fillText("L" + l, 2, oy + l * ch + ch - 2);
+  for (let e = 0; e < E; e += Math.ceil(E / 8)) ctx.fillText("E" + e, ox + e * cw, H - 4);
+
+  const lg = $("legend"); lg.replaceChildren();
+  const mark = el("span", {}, el("span", { class: "dot", style: `background:none;border:2px solid ${css("--mark")};border-radius:2px` }), "experts the latest token used");
+  if (mapMode === "heat") {
+    lg.append(el("span", {}, el("span", { class: "dot", style: `background:${surf}` }), "never routed"),
+              el("span", {}, el("span", { class: "dot", style: `background:rgba(${rgb},.5)` }), "routed"),
+              el("span", {}, el("span", { class: "dot", style: `background:rgb(${rgb})` }), `most routed (${int(max)}×)`), mark);
+  } else {
+    heat.nodes.forEach((n, i) => lg.append(el("span", {}, el("span", { class: "dot", style: `background:${nodeColor[n] || PALETTE[i % PALETTE.length]}` }), n === "local" ? "coordinator (RAM or disk)" : n)));
+    lg.append(mark);
+  }
+}
+$("map").addEventListener("mousemove", ev => {
+  const tip = $("tip");
+  if (!heat || !heat.layers) return;
+  const r = ev.target.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const e = Math.floor((x - cell.ox) / cell.w), l = Math.floor((y - cell.oy) / cell.h);
+  if (e < 0 || l < 0 || e >= heat.experts || l >= heat.layers) { tip.style.display = "none"; return; }
+  tip.textContent = `layer ${l} · expert ${e} · routed ${int(heat.counts[l][e])}× · on ${heat.nodes[heat.owners[l][e]]}`;
+  tip.style.display = "block";
+  tip.style.left = Math.min(x + 12, r.width - tip.offsetWidth - 4) + "px"; tip.style.top = (y + 14) + "px";
+});
+$("map").addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
+$("mapMode").addEventListener("click", ev => {
+  const b = ev.target.closest("button"); if (!b) return;
+  mapMode = b.dataset.m;
+  for (const x of $("mapMode").children) x.classList.toggle("on", x === b);
+  drawMap();
+});
+addEventListener("resize", () => { drawChart(); drawMap(); });
+
+// ---- chat -----------------------------------------------------------------
+const history = [];
+$("clear").onclick = () => { history.length = 0; $("log").replaceChildren(el("span", { class: "muted" }, "Cleared.")); };
+$("msg").addEventListener("keydown", ev => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("chat").requestSubmit(); } });
+$("chat").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  const text = $("msg").value.trim(); if (!text) return;
+  const log = $("log");
+  if (!history.length) log.replaceChildren();
+  history.push({ role: "user", content: text });
+  log.append(el("div", { class: "u" }, "You: " + text));
+  const out = el("div", { class: "a" }, ""); log.append(out);
+  $("msg").value = ""; $("send").disabled = true; $("chatErr").textContent = "";
+  let answer = "";
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: history, stream: true, max_tokens: +$("maxtok").value || 128 }) });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const reader = r.body.getReader(), dec = new TextDecoder(); let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        const delta = JSON.parse(line.slice(6)).choices[0].delta?.content || "";
+        answer += delta; out.textContent = answer; log.scrollTop = log.scrollHeight;
+      }
+    }
+    history.push({ role: "assistant", content: answer });
+  } catch (e) {
+    $("chatErr").textContent = "Request failed: " + e.message; history.pop();
+  } finally { $("send").disabled = false; }
+});
+
+pollStatus(); pollHeat();
+})();
+</script>
+</body>
+</html>
