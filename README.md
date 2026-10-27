@@ -246,3 +246,7 @@ checkpoints (they agree to about 1e-5).
   dequantization for the official DeepSeek-V3 / Kimi K2 files.
 * GLM / Qwen3-Next / gpt-oss adapters; GGUF input.
 * Authentication (shared secret) and TLS for untrusted networks.
+
+## License
+
+Apache License 2.0, see [LICENSE](LICENSE).
