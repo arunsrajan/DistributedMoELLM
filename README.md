@@ -65,7 +65,8 @@ that already fits.
   `--discover 3` finds them. `--workers host:port,...` works across subnets.
 * **Faithful by default.** f32 activations, the router's decisions unchanged.
   Expert residency `--expert-format f32|int8|int4`, `--dense-format f16|int8|f32`
-  (colibri's default, ~1.5x faster decode), `--wire f16` (half the traffic).
+  (colibri's default, ~1.5x faster decode), `--wire f16|int8` (half / about a
+  quarter of the network traffic; see "Compressing the network traffic").
 * **Reads colibri int4 containers directly** (`merged_weight` + `qs`,
   `qwen36_meta.json`), and uses colibri's `.coli_usage` routing statistics to
   place hot experts first.
@@ -217,6 +218,38 @@ help moderately; on Wi-Fi the 48 round trips per token eat the gain. The
 reliable win is capacity: a model whose experts do not fit in one machine's
 RAM (Qwen3-235B-A22B, ~120 GB int4) runs from RAM across several machines
 instead of from disk.
+
+### Compressing the network traffic (`--wire`)
+
+Per token and MoE layer each worker gets the token's hidden state (2048
+numbers, 8 KiB as f32) and sends back its partial result of the same size;
+reading a prompt sends one such row per prompt token. Measured on real
+Qwen3-Coder-30B activations:
+
+| Encoding | Size | Cost per row | Notes |
+|---|---|---|---|
+| zlib / lzma (lossless) | 93-106% | 95-1,540 us | activations are float noise to a compressor: no gain, only cost |
+| `--wire f16` | 50% | ~6 us | ~0.02% error |
+| `--wire int8` | 27% | ~5-18 us | int8 with one scale per 64 values |
+
+With two worker processes and a simulated link (`MOELAN_SIM_NET="rtt_ms,mbit"`
+adds latency and transfer time to every worker message), 465-token prompt then
+16 tokens:
+
+| Link | Wire | Prompt reading | Generation | Moved | Same 16 tokens as f32 |
+|---|---|---|---|---|---|
+| Wi-Fi 200 Mbit/s, 3 ms | f32 | 44.0 s | 1.27 tok/s | 719 MiB | yes |
+| Wi-Fi 200 Mbit/s, 3 ms | f16 | 37.4 s | 1.33 tok/s | 359 MiB | yes |
+| Wi-Fi 200 Mbit/s, 3 ms | int8 | 33.9 s | 1.30 tok/s | 191 MiB | yes |
+| wired 1 Gbit/s, 0.3 ms | any | 30-31 s | 1.7-2.0 tok/s | | |
+
+So: compression does **not** make token generation faster. Generating is
+bound by the 48 round trips per token, not by bytes (8 KiB per layer is
+0.3 ms even on Wi-Fi). It does speed up **reading prompts on slow links**
+(-23% on Wi-Fi with int8), which is what coding agents wait on. On wired
+gigabit it makes no difference. An earlier int8 variant with one scale per
+row flipped a near-tie word ("Existing" -> "Related") after a few tokens;
+per-64 scales kept the output identical in every test, as did f16.
 
 ### Several conversations at once (batching)
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import socket
 import threading
 import time
@@ -26,10 +27,24 @@ from .config import ModelConfig, model_fingerprint
 from .experts import CheckpointSource, ExpertStore, default_format, resident_bytes
 from .model import ExpertBackend, group_by_expert
 from .planner import LOCAL, Plan, make_plan
-from .protocol import PROTOCOL_VERSION, recv_msg, send_msg, tune_socket
+from .protocol import (PROTOCOL_VERSION, WIRE_FORMATS, decode_rows, encode_rows, recv_msg, send_msg,
+                       tune_socket)
 
 log = logging.getLogger("moelan.coordinator")
 RETRY_AFTER_S = 30.0
+
+# MOELAN_SIM_NET="rtt_ms,mbit_per_s" adds half a round trip plus the transfer
+# time to every message to and from workers, to measure wire formats and LAN
+# speeds on one machine. Off unless set.
+_SIM_NET = None
+if os.environ.get("MOELAN_SIM_NET"):
+    _rtt, _mbit = (float(v) for v in os.environ["MOELAN_SIM_NET"].split(","))
+    _SIM_NET = (_rtt / 2000.0, _mbit * 1e6 / 8)
+
+
+def _sim_delay(nbytes: int) -> None:
+    half_rtt, bytes_per_s = _SIM_NET
+    time.sleep(half_rtt + nbytes / bytes_per_s)
 
 
 @dataclass
@@ -42,6 +57,7 @@ class WorkerConn:
     failed_at: float = 0.0
     requests: int = 0
     bytes_out: int = 0
+    bytes_in: int = 0
     wait_s: float = 0.0       # coordinator blocked on this worker's reply
     remote_s: float = 0.0     # of which the worker was computing
     resident_bytes: int = 0
@@ -63,10 +79,14 @@ class WorkerConn:
         return self.info
 
     def send(self, header, arrays=None, blobs=None) -> None:
+        if _SIM_NET:   # benchmarking a LAN on one machine: latency + bandwidth per message
+            _sim_delay(sum(a.nbytes for a in (arrays or {}).values()) + sum(len(b) for b in (blobs or {}).values()))
         send_msg(self.sock, header, arrays, blobs)
 
     def recv(self):
         h, arrays, _ = recv_msg(self.sock)
+        if _SIM_NET:
+            _sim_delay(sum(a.nbytes for a in arrays.values()))
         if not h.get("ok", False):
             raise RuntimeError(f"{self.address}: {h.get('error', 'request failed')}")
         return h, arrays
@@ -111,8 +131,8 @@ class DistributedBackend(ExpertBackend):
         super().__init__()
         self.heat_in = dict(heat or {})
         self.gpu_spec, self.gpu_budget, self.gpu_mode = gpu, gpu_budget, gpu_mode
-        if wire not in ("f32", "f16"):
-            raise ValueError("wire must be f32 or f16")
+        if wire not in WIRE_FORMATS:
+            raise ValueError(f"wire must be one of {WIRE_FORMATS}")
         self.cfg = cfg
         self.wire = wire
         self.fmt = fmt = fmt or default_format(cfg)
@@ -249,13 +269,13 @@ class DistributedBackend(ExpertBackend):
                 uniq, remap = np.unique(sub_rows, return_inverse=True)
                 sub_w = np.concatenate([weights[offsets[i]:offsets[i + 1]] for i in sel])
                 sub_off = np.concatenate([[0], np.cumsum([offsets[i + 1] - offsets[i] for i in sel])])
-                xs = x[uniq].astype(np.float16 if self.wire == "f16" else np.float32)
+                xs = encode_rows(x[uniq], self.wire, "x")
                 try:
                     c.send({"op": "moe", "fingerprint": self.fingerprint, "layer": layer, "wire": self.wire},
-                           {"x": xs, "experts": experts[sel], "offsets": sub_off.astype(np.int32),
-                            "rows": remap.astype(np.int32), "weights": sub_w})
+                           dict(xs, experts=experts[sel], offsets=sub_off.astype(np.int32),
+                                rows=remap.astype(np.int32), weights=sub_w))
                     c.requests += 1
-                    c.bytes_out += xs.nbytes
+                    c.bytes_out += sum(a.nbytes for a in xs.values())
                     inflight.append((c, sel, uniq))
                 except (OSError, ConnectionError) as exc:
                     c.mark_failed(exc)
@@ -271,7 +291,8 @@ class DistributedBackend(ExpertBackend):
                 try:
                     h, arrays = c.recv()
                     c.remote_s += h.get("compute_s", 0.0)
-                    out[uniq[arrays["rows"]]] += arrays["y"].astype(np.float32)
+                    c.bytes_in += sum(a.nbytes for a in arrays.values())
+                    out[uniq[arrays["rows"]]] += decode_rows(arrays, "y")
                 except (OSError, RuntimeError, ConnectionError) as exc:
                     c.mark_failed(exc)
                     pending.extend(sel)
@@ -283,7 +304,8 @@ class DistributedBackend(ExpertBackend):
         for c in self.conns.values():
             row = {"node": c.node_id, "address": c.address, "alive": c.alive,
                    "experts": len(self.plan.per_node.get(c.node_id, [])),
-                   "requests": c.requests, "mib_out": c.bytes_out / 2**20, "wait_s": c.wait_s,
+                   "requests": c.requests, "mib_out": c.bytes_out / 2**20, "mib_in": c.bytes_in / 2**20,
+                   "wait_s": c.wait_s,
                    "compute_s": c.remote_s, "budget_bytes": c.info.get("budget_bytes"),
                    "cpus": c.info.get("cpus"), "resident_bytes": c.resident_bytes,
                    "kernels": c.info.get("kernels"), "gpu": getattr(c, "gpu", None) or None}

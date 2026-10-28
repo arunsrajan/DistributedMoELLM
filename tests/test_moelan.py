@@ -982,3 +982,40 @@ def test_scheduler_survives_a_failing_step(tiny, monkeypatch):
         assert _http(server, "/v1/completions", {"prompt": "b", "max_tokens": 3})[0] == 200
     finally:
         server.shutdown()
+
+
+# --- wire formats ---------------------------------------------------------------------
+
+from moelan.protocol import decode_rows, encode_rows
+
+
+def test_wire_encodings_size_and_error():
+    a = np.random.default_rng(6).standard_normal((5, 2048)).astype(np.float32) * 3
+    a[:, 7] *= 40                                                    # an outlier channel, as in real activations
+    for wire, ratio, tol in (("f32", 1.0, 0.0), ("f16", 0.5, 1e-3), ("int8", 0.27, 6e-3)):
+        enc = encode_rows(a, wire, "x")
+        size = sum(v.nbytes for v in enc.values())
+        assert size <= a.nbytes * ratio                             # int8: + one f32 scale per 64 values
+        err = np.abs(decode_rows(enc, "x") - a)[:, 64:].max(1) / np.abs(a[:, 64:]).max(1)
+        assert err.max() <= tol                                     # the outlier does not spoil other groups
+    z = encode_rows(np.zeros((2, 8), np.float32), "int8", "x")       # all-zero rows stay zero
+    assert not decode_rows(z, "x").any()
+
+
+@pytest.mark.parametrize("wire,tol", [("f16", 0.02), ("int8", 0.08)])
+def test_distributed_wire_formats_stay_close(tiny, tmp_path, wire, tol):
+    toks = [256] + list(b"compressed activations")
+    ref_m = MoEModel(tiny)
+    ref = ref_m.forward(toks, ref_m.new_cache())
+    w = Worker(tmp_path, f"w-{wire}", 2**22)
+    try:
+        backend = DistributedBackend(str(tiny), load_config(tiny), [w.address], wire=wire,
+                                     progress=lambda m: None)
+        m = MoEModel(tiny, backend=backend)
+        out = m.forward(toks, m.new_cache())
+        assert np.abs(out - ref).max() <= tol * np.abs(ref).max()
+        row = next(r for r in backend.stats() if r["node"] == f"w-{wire}")
+        assert row["mib_in"] > 0 and row["mib_out"] > 0
+        backend.close()
+    finally:
+        w.kill()

@@ -37,8 +37,9 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
                    help="attention/output-head weights on the coordinator: f16 = as stored, exact "
                         "(default with numba), f32 (default without), int8 = group-quantized like "
                         "colibri's default (fastest, not exact)")
-    p.add_argument("--wire", choices=["f32", "f16"], default="f32",
-                   help="activation precision on the network (f16 halves traffic)")
+    p.add_argument("--wire", choices=["f32", "f16", "int8"], default="f32",
+                   help="activations on the network: f32 (exact), f16 (half the bytes, ~0.02%% "
+                        "error), int8 (a quarter, ~0.4%% error); matters for long prompts on slow links")
     p.add_argument("--no-replicate", action="store_true", help="do not replicate hot experts")
     p.add_argument("--heat", default=None,
                    help="routing statistics file: read to place hot experts first, updated after the run "

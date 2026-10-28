@@ -24,7 +24,7 @@ from . import __version__
 from .config import load_config, model_fingerprint
 from .discovery import Beacon, local_ip
 from .experts import CacheSource, CheckpointSource, ExpertStore
-from .protocol import PROTOCOL_VERSION, recv_msg, send_msg, tune_socket
+from .protocol import PROTOCOL_VERSION, decode_rows, encode_rows, recv_msg, send_msg, tune_socket
 
 log = logging.getLogger("moelan.worker")
 
@@ -191,7 +191,7 @@ class _Handler(socketserver.BaseRequestHandler):
         if op == "moe":
             t0 = time.perf_counter()
             store = st.stores[h["fingerprint"]]
-            x = arrays["x"].astype(np.float32, copy=False)
+            x = decode_rows(arrays, "x")
             experts, offsets = arrays["experts"], arrays["offsets"]
             rows, weights = arrays["rows"], arrays["weights"].astype(np.float32, copy=False)
             groups = [(int(experts[i]), rows[offsets[i]:offsets[i + 1]],
@@ -202,8 +202,7 @@ class _Handler(socketserver.BaseRequestHandler):
             st.requests += 1
             st.busy_s += dt
             return ({"ok": True, "compute_s": dt},
-                    {"rows": touched.astype(np.int32),
-                     "y": y[touched].astype(np.float16 if h.get("wire") == "f16" else np.float32)})
+                    dict(encode_rows(y[touched], h.get("wire", "f32"), "y"), rows=touched.astype(np.int32)))
         if op == "stats":
             return {"ok": True, "requests": st.requests, "busy_s": st.busy_s,
                     "stores": {fp: {"pinned": len(s.pinned), "hits": s.hits, "misses": s.misses,

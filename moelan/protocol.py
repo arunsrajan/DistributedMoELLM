@@ -89,6 +89,40 @@ def recv_msg(sock: socket.socket) -> tuple[dict, dict[str, np.ndarray], dict[str
     return header, arrays, blobs
 
 
+WIRE_FORMATS = ("f32", "f16", "int8")
+
+
+WIRE_GROUP = 64   # int8: one scale per this many values (a few outlier channels per row
+                  # would otherwise set the scale for the whole row and flip near-tie tokens)
+
+
+def encode_rows(a: np.ndarray, wire: str, name: str) -> dict[str, np.ndarray]:
+    """Activations for the network. f16 halves them (~0.02% error); int8 with
+    one f32 scale per 64 values takes 27% of f32. Lossless compressors do not
+    help here: activations are float noise to zlib / lzma (93-106% of their
+    size, at 100+ us per row)."""
+    if wire == "f16":
+        return {name: a.astype(np.float16)}
+    if wire == "int8":
+        n, d = a.shape
+        gs = WIRE_GROUP if d % WIRE_GROUP == 0 else d
+        g = a.reshape(n, d // gs, gs)
+        s = np.abs(g).max(axis=2, keepdims=True) / 127.0
+        s[s == 0] = 1.0
+        q = np.clip(np.rint(g / s), -127, 127).astype(np.int8).reshape(n, d)
+        return {name: q, name + "_scale": s[:, :, 0].astype(np.float32)}
+    return {name: np.ascontiguousarray(a, np.float32)}
+
+
+def decode_rows(arrays: dict, name: str) -> np.ndarray:
+    a = arrays[name]
+    if a.dtype == np.int8:
+        s = arrays[name + "_scale"]
+        n, d = a.shape
+        return (a.reshape(n, s.shape[1], -1).astype(np.float32) * s[:, :, None]).reshape(n, d)
+    return a.astype(np.float32, copy=False)
+
+
 def tune_socket(sock: socket.socket) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
