@@ -22,6 +22,7 @@ from . import kernels
 from .batching import Batcher, GenRequest
 from .model import MoEModel
 from .tokenizer import Tokenizer
+from .tools import parse_tool_calls, safe_prefix_len
 
 MAX_BODY = 4 * 1024 * 1024
 RATE_WINDOW_S = 3.0
@@ -51,11 +52,12 @@ class Telemetry:
             self.active[rid] = {"id": rid, "prompt_tokens": prompt_tokens, "generated": 0,
                                 "started": time.time(), "admitted": None, "first_token": None}
 
-    def admit(self, rid: str) -> None:
+    def admit(self, rid: str, cached: int = 0) -> None:
         with self.lock:
             a = self.active.get(rid)
             if a is not None:
                 a["admitted"] = time.time()
+                a["cached_tokens"] = cached
 
     def token(self, rid: str) -> None:
         now = time.time()
@@ -78,6 +80,7 @@ class Telemetry:
         decode_n = max(a["generated"] - 1, 0)
         self.recent.appendleft({
             "id": a["id"], "prompt_tokens": a["prompt_tokens"], "completion_tokens": a["generated"],
+            "cached_tokens": a.get("cached_tokens", 0),
             "wait_s": round((a["admitted"] or first) - a["started"], 3),
             "prefill_s": round(first - (a["admitted"] or a["started"]), 3),
             "total_s": round(now - a["started"], 3),
@@ -122,7 +125,8 @@ def node_stats(model: MoEModel) -> list[dict]:
         return b.stats()
     st = b.store
     return [{"node": "local", "address": "-", "alive": True, "experts": len(st.pinned),
-             "hits": st.hits, "disk_reads": st.misses, "resident_bytes": st.resident_bytes()}]
+             "hits": st.hits, "disk_reads": st.misses, "resident_bytes": st.resident_bytes(),
+             "gpu": st.gpu.stats() if st.gpu else st.gpu_info}]
 
 
 def heat_payload(model: MoEModel) -> dict:
@@ -209,8 +213,15 @@ class _Handler(BaseHTTPRequestHandler):
             req = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
             return self._json(400, {"error": "invalid JSON"})
+        tools = None
         if self.path == "/v1/chat/completions":
-            prompt = self.tok.chat_prompt(req.get("messages", []))
+            tools = req.get("tools") or None
+            if req.get("tool_choice") == "none":
+                tools = None   # the model is not told about the tools at all
+            try:
+                prompt = self.tok.chat_prompt(req.get("messages", []), tools=tools)
+            except Exception as exc:  # template errors (bad roles, missing content, ...)
+                return self._json(400, {"error": f"chat template: {exc}"})
             chat = True
         elif self.path == "/v1/completions":
             prompt = req.get("prompt", "")
@@ -222,7 +233,7 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(400, {"error": "empty prompt"})
         rid = f"moelan-{uuid.uuid4().hex[:12]}"
         try:
-            gen = GenRequest(rid, ids, max_new_tokens=int(req.get("max_tokens", 256)),
+            gen = GenRequest(rid, ids, max_new_tokens=int(req.get("max_tokens") or req.get("max_completion_tokens") or 256),
                              temperature=float(req.get("temperature", 0.0)),
                              top_p=float(req.get("top_p", 1.0)), top_k=int(req.get("top_k", 0)),
                              seed=req.get("seed"), stop_ids=self.model.cfg.eos_token_ids)
@@ -231,7 +242,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.tel.begin(rid, len(ids))
         self.batcher.submit(gen)
         if req.get("stream"):
-            return self._stream(rid, gen, chat)
+            return self._stream(rid, gen, chat, tools)
         out = []
         t0 = time.perf_counter()
         try:
@@ -239,50 +250,83 @@ class _Handler(BaseHTTPRequestHandler):
                 out.append(t)
         except Exception as exc:
             return self._json(500, {"error": f"generation failed: {exc}"})
-        text = self.tok.decode([t for t in out if t not in self.model.cfg.eos_token_ids])
+        eos = set(self.model.cfg.eos_token_ids)
+        text = self.tok.decode([t for t in out if t not in eos], keep_special=bool(tools))
+        finish = "length" if out and out[-1] not in eos and len(out) >= gen.max_new_tokens else "stop"
         usage = {"prompt_tokens": len(ids), "completion_tokens": len(out),
-                 "total_tokens": len(ids) + len(out),
+                 "total_tokens": len(ids) + len(out), "cached_tokens": gen.cached,
                  "tokens_per_second": len(out) / max(time.perf_counter() - t0, 1e-9)}
-        choice = ({"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
-                  if chat else {"index": 0, "text": text, "finish_reason": "stop"})
+        if chat:
+            message = {"role": "assistant", "content": text}
+            if tools:
+                content, calls = parse_tool_calls(text, tools)
+                if calls:
+                    message = {"role": "assistant", "content": content, "tool_calls": calls}
+                    finish = "tool_calls"
+            choice = {"index": 0, "message": message, "finish_reason": finish}
+        else:
+            choice = {"index": 0, "text": text, "finish_reason": finish}
         self._json(200, {"id": rid, "object": "chat.completion" if chat else "text_completion",
                          "created": int(time.time()), "model": self.name,
                          "choices": [choice], "usage": usage})
 
-    def _stream(self, rid, gen: GenRequest, chat):
+    def _stream(self, rid, gen: GenRequest, chat, tools=None):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
         eos = set(self.model.cfg.eos_token_ids)
+        finish = "stop"
         try:
-            self._relay(rid, gen, chat, eos)
+            finish = self._relay(rid, gen, chat, eos, tools)
         except (BrokenPipeError, ConnectionError):
             gen.cancelled = True  # client went away: the scheduler drops the request
             return
         except Exception as exc:
             self._event({"id": rid, "error": f"generation failed: {exc}"})
-        end = ({"index": 0, "delta": {}, "finish_reason": "stop"} if chat
-               else {"index": 0, "text": "", "finish_reason": "stop"})
+        end = ({"index": 0, "delta": {}, "finish_reason": finish} if chat
+               else {"index": 0, "text": "", "finish_reason": finish})
         self._event({"id": rid, "model": self.name, "choices": [end]})
         self.wfile.write(b"data: [DONE]\n\n")
         self.close_connection = True
 
-    def _relay(self, rid, gen: GenRequest, chat, eos) -> None:
-        """Forward the scheduler's tokens to the client as text deltas."""
+    def _relay(self, rid, gen: GenRequest, chat, eos, tools=None) -> str:
+        """Forward the scheduler's tokens to the client as text deltas; with
+        tools, hold back anything from a tool-call start on and send the parsed
+        calls as ``tool_calls`` deltas at the end. Returns the finish reason."""
         out, sent = [], ""
+        obj = "chat.completion.chunk" if chat else "text_completion"
+
+        def send(delta):
+            chunk = {"index": 0, "delta": delta} if chat else {"index": 0, "text": delta.get("content", "")}
+            self._event({"id": rid, "object": obj, "model": self.name, "choices": [chunk]})
+
+        if chat:
+            send({"role": "assistant", "content": ""})
+        last = None
         for t in gen.tokens():
+            last = t
             if t in eos:
                 continue  # the scheduler ends the request right after
             out.append(t)
-            text = self.tok.decode(out)
-            if text.endswith("�"):
+            text = self.tok.decode(out, keep_special=bool(tools))
+            if text.endswith("\ufffd"):
                 continue  # incomplete UTF-8 sequence, wait for the next token
-            delta, sent = text[len(sent):], text
-            chunk = ({"index": 0, "delta": {"content": delta}} if chat else {"index": 0, "text": delta})
-            self._event({"id": rid, "object": "chat.completion.chunk" if chat else "text_completion",
-                         "model": self.name, "choices": [chunk]})
+            upto = safe_prefix_len(text) if tools else len(text)
+            if upto > len(sent):
+                send({"content": text[len(sent):upto]})
+                sent = text[:upto]
+        finish = "length" if last is not None and last not in eos and len(out) >= gen.max_new_tokens else "stop"
+        if tools:
+            text = self.tok.decode(out, keep_special=True)
+            _, calls = parse_tool_calls(text, tools)
+            if calls:
+                send({"tool_calls": [dict(c, index=i) for i, c in enumerate(calls)]})
+                return "tool_calls"
+            if len(text) > len(sent):   # a tool-call start that never became a call
+                send({"content": text[len(sent):]})
+        return finish
 
     def _event(self, obj) -> None:
         self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
@@ -344,11 +388,11 @@ class WorkerMonitor(threading.Thread):
 
 def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
                 host: str = "127.0.0.1", port: int = 8000, monitor: WorkerMonitor | None = None,
-                max_batch: int = 4):
+                max_batch: int = 4, prompt_cache_tokens: int = 4096):
     tel = Telemetry()
     batcher = None
     if model is not None:
-        batcher = Batcher(model, tel, max_batch=max_batch)
+        batcher = Batcher(model, tel, max_batch=max_batch, prompt_cache_tokens=prompt_cache_tokens)
         batcher.start()
     handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name,
                                       "batcher": batcher, "tel": tel, "monitor": monitor})
@@ -356,8 +400,10 @@ def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
 
 
 def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: str = "127.0.0.1",
-               port: int = 8000, monitor: WorkerMonitor | None = None, max_batch: int = 4):
-    httpd = make_server(model, tok, name, host, port, monitor, max_batch=max_batch)
+               port: int = 8000, monitor: WorkerMonitor | None = None, max_batch: int = 4,
+               prompt_cache_tokens: int = 4096):
+    httpd = make_server(model, tok, name, host, port, monitor, max_batch=max_batch,
+                        prompt_cache_tokens=prompt_cache_tokens)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     print(f"dashboard:  http://{shown}:{port}/")
     if model is not None:

@@ -19,6 +19,7 @@ ENABLED = False
 WHY_DISABLED = ""
 MAX_ROWS = 1 << 30  # all sizes go through the kernels
 ROW_DECODE_FROM = 4  # from this many input rows, decode each weight row once
+BLAS_FROM = 8        # from this many rows (prompt reading), widen the matrix once and use BLAS
 
 if os.environ.get("MOELAN_KERNELS", "1") != "0":
     try:
@@ -178,6 +179,41 @@ if ENABLED:
                     acc += wf[i] * x[r, i]
                 y[r, o] = acc
         return y
+
+    @njit(fastmath=True, cache=True, nogil=True)
+    def _q4_dequant(raw, s, gs, xor, out):
+        # Single-threaded and GIL-free, so several experts can be widened at
+        # once from Python threads (the parallel kernels are not re-entrant).
+        O = raw.shape[0]
+        half = gs // 2
+        ng = out.shape[1] // gs
+        for o in range(O):
+            for g in range(ng):
+                sc = s[o, g]
+                for j in range(half):
+                    b = np.int32(raw[o, g * half + j] ^ xor)
+                    out[o, g * gs + 2 * j] = np.float32((b & np.int32(15)) - np.int32(8)) * sc
+                    out[o, g * gs + 2 * j + 1] = np.float32((b >> np.int32(4)) - np.int32(8)) * sc
+
+    @njit(fastmath=True, cache=True, nogil=True)
+    def _q8_dequant(q, s, gs, out):
+        O, I = q.shape
+        for o in range(O):
+            for g in range(I // gs):
+                sc = s[o, g]
+                for j in range(gs):
+                    out[o, g * gs + j] = np.float32(q[o, g * gs + j]) * sc
+
+
+def q4_dequant(raw, s, gs: int, offset: bool, out: np.ndarray) -> np.ndarray:
+    _q4_dequant(raw, s, gs, np.uint8(0 if offset else 0x88), out)
+    return out
+
+
+def q8_dequant(q, s, gs: int, out: np.ndarray) -> np.ndarray:
+    _q8_dequant(q, s, gs, out)
+    return out
+
 
 def h16_matmul_t(x: np.ndarray, bits: np.ndarray, bf16: bool) -> np.ndarray:
     """x @ W.T for W stored as 16-bit floats (uint16 bits), decoded exactly."""

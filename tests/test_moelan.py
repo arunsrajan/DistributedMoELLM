@@ -23,12 +23,12 @@ def tiny(tmp_path_factory):
 class Worker:
     """An in-process worker on an ephemeral port."""
 
-    def __init__(self, tmp_path, name, budget, model_dir=None):
+    def __init__(self, tmp_path, name, budget, model_dir=None, **extra):
         self.ready, self.stop = threading.Event(), threading.Event()
         self.t = threading.Thread(target=serve, daemon=True, kwargs=dict(
             host="127.0.0.1", port=0, budget=budget, cache_root=tmp_path / name,
             model_dir=model_dir, node_id=name, advertise=False,
-            ready=self.ready, stop=self.stop))
+            ready=self.ready, stop=self.stop, **extra))
         self.t.start()
         assert self.ready.wait(10)
         self.address = f"127.0.0.1:{self.ready.port}"
@@ -666,3 +666,189 @@ def test_server_batches_concurrent_requests(tiny):
         assert status["batch"]["avg_batch"] > 1  # the concurrent ones shared steps
     finally:
         server.shutdown()
+
+
+# --- tool calling -----------------------------------------------------------------
+
+from moelan.tools import normalize_messages, parse_tool_calls, safe_prefix_len
+
+json = _json
+
+WEATHER = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Weather for a city",
+    "parameters": {"type": "object", "properties": {
+        "city": {"type": "string"}, "days": {"type": "integer"}, "metric": {"type": "boolean"},
+        "where": {"type": "object"}}, "required": ["city"]}}}]
+
+
+def test_parse_qwen3_coder_xml_with_schema_types():
+    text = ("Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nNew York\n</parameter>\n"
+            "<parameter=days>\n3\n</parameter>\n<parameter=metric>\ntrue\n</parameter>\n"
+            "<parameter=where>\n{\"lat\": 40.7}\n</parameter>\n</function>\n</tool_call>")
+    content, calls = parse_tool_calls(text, WEATHER)
+    assert content == "Let me check." and len(calls) == 1
+    fn = calls[0]["function"]
+    assert fn["name"] == "get_weather" and calls[0]["type"] == "function" and calls[0]["id"].startswith("call_")
+    assert json.loads(fn["arguments"]) == {"city": "New York", "days": 3, "metric": True, "where": {"lat": 40.7}}
+
+
+def test_parse_hermes_json_and_multiple_calls():
+    text = ('<tool_call>\n{"name": "get_weather", "arguments": {"city": "Oslo"}}\n</tool_call>\n'
+            '<tool_call>\n{"name": "get_weather", "arguments": "{\\"city\\": \\"Rome\\"}"}\n</tool_call>')
+    content, calls = parse_tool_calls(text, WEATHER)
+    assert content is None
+    assert [json.loads(c["function"]["arguments"])["city"] for c in calls] == ["Oslo", "Rome"]
+
+
+def test_parse_deepseek_v3_format():
+    text = ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n"
+            "```json\n{\"city\": \"Lima\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>")
+    _, calls = parse_tool_calls(text, WEATHER)
+    assert calls[0]["function"]["name"] == "get_weather"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Lima"}
+
+
+def test_plain_text_and_broken_calls_stay_text():
+    assert parse_tool_calls("Just an answer.", WEATHER) == ("Just an answer.", [])
+    broken = "<tool_call>\nnot json and no function\n</tool_call>"
+    assert parse_tool_calls(broken, WEATHER) == (broken, [])
+
+
+def test_streaming_never_leaks_a_partial_tool_tag():
+    assert safe_prefix_len("Hello <tool_c") == len("Hello ")
+    assert safe_prefix_len("Hello <tool_call>\n<function=x>") == len("Hello ")
+    assert safe_prefix_len("a < b") == len("a < b")
+    assert safe_prefix_len("price <") == len("price ")
+
+
+def test_normalize_messages_for_templates():
+    msgs = normalize_messages([{"role": "assistant", "content": None, "tool_calls": [
+        {"id": "1", "type": "function", "function": {"name": "f", "arguments": "{\"a\": 1}"}}]},
+        {"role": "user", "content": [{"type": "text", "text": "hi"}]}])
+    assert msgs[0]["content"] == "" and msgs[0]["tool_calls"][0]["function"]["arguments"] == {"a": 1}
+    assert msgs[1]["content"] == "hi"
+
+
+class _ScriptedBatcher:
+    """Stands in for the scheduler: answers every request with fixed text."""
+
+    def __init__(self, text, tok):
+        self.ids = tok.encode(text)
+
+    def submit(self, gen):
+        for t in self.ids:
+            gen.out.put(t)
+        gen.out.put(None)
+
+    def stats(self):
+        return {}
+
+
+def _tool_server(tiny, text):
+    from moelan.tokenizer import Tokenizer
+    tok = Tokenizer(tiny)
+    server = make_server(MoEModel(tiny), tok, "tiny", port=0)
+    server.RequestHandlerClass.batcher = _ScriptedBatcher(text, tok)
+    _serve(server)
+    return server
+
+
+def test_server_returns_tool_calls(tiny):
+    reply = "Checking.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+    server = _tool_server(tiny, reply)
+    try:
+        body = {"messages": [{"role": "user", "content": "weather in Paris?"}], "tools": WEATHER}
+        r = _json.loads(_http(server, "/v1/chat/completions", body)[2])
+        ch = r["choices"][0]
+        assert ch["finish_reason"] == "tool_calls" and ch["message"]["content"] == "Checking."
+        assert _json.loads(ch["message"]["tool_calls"][0]["function"]["arguments"]) == {"city": "Paris"}
+        # without tools the same text is returned as plain content
+        r = _json.loads(_http(server, "/v1/chat/completions", {"messages": body["messages"]})[2])
+        assert r["choices"][0]["finish_reason"] == "stop" and "<tool_call>" in r["choices"][0]["message"]["content"]
+    finally:
+        server.shutdown()
+
+
+def test_server_streams_tool_calls(tiny):
+    reply = "Sure <tool_call>\n<function=get_weather>\n<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>"
+    server = _tool_server(tiny, reply)
+    try:
+        body = {"messages": [{"role": "user", "content": "x"}], "tools": WEATHER, "stream": True}
+        raw = _http(server, "/v1/chat/completions", body)[2].decode()
+        events = [_json.loads(l[6:]) for l in raw.split("\n\n") if l.startswith("data: {")]
+        text = "".join(e["choices"][0]["delta"].get("content", "") for e in events)
+        assert text == "Sure " and "<tool" not in text
+        calls = [c for e in events for c in e["choices"][0]["delta"].get("tool_calls", [])]
+        assert calls[0]["index"] == 0 and _json.loads(calls[0]["function"]["arguments"]) == {"city": "Rome"}
+        assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+    finally:
+        server.shutdown()
+
+
+def test_prompt_cache_reuses_shared_prefix(tiny):
+    m = MoEModel(tiny)
+    base = [256] + list(b"You are a helpful assistant with many tools. ")
+    p1, p2 = base + list(b"First question?"), base + list(b"Second one!")
+    want = list(m.generate(p2, max_new_tokens=8, stop_ids=[]))
+    b = Batcher(m, max_batch=1, prompt_cache_tokens=4096)
+    b.start()
+    r1 = b.submit(GenRequest("a", p1, max_new_tokens=8))
+    list(r1.tokens())
+    r2 = b.submit(GenRequest("b", p2, max_new_tokens=8))
+    assert list(r2.tokens()) == want            # same output as computing everything
+    assert r1.cached == 0 and r2.cached == len(base)
+    st = b.stats()["prompt_cache"]
+    assert st["hits"] == 1 and st["tokens_saved"] == len(base)
+
+
+# --- hybrid GPU / CPU experts ---------------------------------------------------
+
+from moelan.accel import choose_gpu_experts
+
+
+def test_choose_gpu_experts_takes_hot_share_per_layer():
+    cands = [(l, e) for l in (0, 1) for e in range(4)]
+    heat = {(0, 0): 70, (0, 1): 20, (0, 2): 5, (0, 3): 5, (1, 3): 50, (1, 2): 50}
+    got = choose_gpu_experts(cands, heat, share=0.6)
+    assert set(got) == {(0, 0), (1, 3), (1, 2)} or set(got) == {(0, 0), (1, 2), (1, 3)}
+    assert got[:2] in ([(0, 0), (1, 2)], [(0, 0), (1, 3)])          # layers interleaved
+    assert len(choose_gpu_experts(cands, None, share=0.5)) == 4        # no heat: by count
+
+
+def test_gpu_tier_matches_cpu(tiny):
+    pytest.importorskip("torch")
+    toks = [256] + list(b"hybrid experts")
+    cpu = MoEModel(tiny)
+    ref = cpu.forward(toks, cpu.new_cache())
+    hyb = MoEModel(tiny, gpu="torch-cpu", gpu_budget=2**30, gpu_mode="max")
+    tier = hyb.backend.store.gpu
+    assert tier is not None and len(tier.experts) == len(hyb.cfg.moe_layers()) * hyb.cfg.num_experts
+    np.testing.assert_allclose(hyb.forward(toks, hyb.new_cache()), ref, atol=1e-4, rtol=1e-4)
+    assert greedy(hyb, toks, 8) == greedy(cpu, toks, 8)
+    assert tier.calls > 0 and 0 < tier.share < 1
+
+
+def test_gpu_tier_auto_and_budget(tiny):
+    pytest.importorskip("torch")
+    m = MoEModel(tiny, gpu="torch-cpu", gpu_budget=3 * 4 * 3 * 64 * 96, gpu_mode="max")
+    assert len(m.backend.store.gpu.experts) == 3          # budget for exactly three experts
+    a = MoEModel(tiny, gpu="torch-cpu", gpu_budget=2**30, gpu_mode="auto")
+    tier = a.backend.store.gpu
+    n = len(tier.experts) if tier else 0
+    total = len(a.cfg.moe_layers()) * a.cfg.num_experts
+    assert n == 0 or abs(n / total - tier.share) < 0.2   # auto: about its measured share
+
+
+def test_worker_hybrid_gpu(tiny, tmp_path):
+    pytest.importorskip("torch")
+    prompt = [256] + list(b"worker on a gpu")
+    ref = greedy(MoEModel(tiny), prompt)
+    w = Worker(tmp_path, "g1", 2**22, gpu="torch-cpu", gpu_budget=2**30, gpu_mode="max")
+    try:
+        backend = DistributedBackend(str(tiny), load_config(tiny), [w.address], progress=lambda m: None)
+        assert greedy(MoEModel(tiny, backend=backend), prompt) == ref
+        row = next(r for r in backend.stats() if r["node"] == "g1")
+        assert row["gpu"]["experts"] > 0 and row["gpu"]["device"].startswith("torch-cpu")
+        backend.close()
+    finally:
+        w.kill()

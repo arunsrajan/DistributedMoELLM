@@ -51,6 +51,13 @@ def _scratch(rows: int, cols: int) -> tuple[np.ndarray, np.ndarray]:
     return b[0][:rows * cols].reshape(rows, cols), b[1][:rows * cols].reshape(rows, cols)
 
 
+def default_threads() -> int:
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
+
+
+_POOL = ThreadPoolExecutor(max(2, os.cpu_count() or 2), thread_name_prefix="moelan-blas")
+
+
 def silu(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(-x))
 
@@ -96,9 +103,18 @@ class Half16:
         return self.bits.view(np.float16).astype(np.float32)
 
     def matmul_t(self, x):
-        if kernels.ENABLED and x.shape[0] <= 32:   # long prompts: widen once, then BLAS
+        if kernels.ENABLED and x.shape[0] <= 32:
             return kernels.h16_matmul_t(x, self.bits, self.bf16)
-        return x @ self.dequant().T
+        # long prompts: widen and multiply row blocks on parallel threads (each
+        # BLAS call single-threaded), so no full f32 copy and all cores busy
+        O = self.bits.shape[0]
+        step = max(64, -(-O // (4 * _POOL._max_workers)))
+        y = np.empty((x.shape[0], O), np.float32)
+
+        def block(r):
+            y[:, r:r + step] = x @ Half16(self.bits[r:r + step], self.bf16).dequant().T
+        list(_POOL.map(block, range(0, O, step)))
+        return y
 
     @property
     def nbytes(self):
@@ -129,7 +145,10 @@ class GroupQuant:
         return (self.q.reshape(O, I // self.gs, self.gs) * self.s[:, :, None]).reshape(O, I)
 
     def matmul_t(self, x):
-        if kernels.ENABLED and x.shape[0] <= kernels.MAX_ROWS:
+        if kernels.ENABLED and x.shape[0] >= kernels.BLAS_FROM:   # many rows: widen once, BLAS
+            _, f = _scratch(*self.q.shape)
+            return x @ kernels.q8_dequant(self.q, self.s, self.gs, f).T
+        if kernels.ENABLED:
             return kernels.q8_matmul_t(x, self.q, self.s, self.gs)
         O, I = self.q.shape
         ng, gs = I // self.gs, self.gs
@@ -194,7 +213,10 @@ class Packed4:
         return self.to_int8().dequant()
 
     def matmul_t(self, x):
-        if kernels.ENABLED and x.shape[0] <= kernels.MAX_ROWS:
+        if kernels.ENABLED and x.shape[0] >= kernels.BLAS_FROM:   # many rows: widen once, BLAS
+            _, f = _scratch(*self.shape)
+            return x @ kernels.q4_dequant(self.raw, self.s, self.gs, self.offset, f).T
+        if kernels.ENABLED:
             return kernels.q4_matmul_t(x, self.raw, self.s, self.gs, self.offset)
         O, I = self.shape
         ng, gs = I // self.gs, self.gs
@@ -395,10 +417,6 @@ class CacheSource:
 # The store
 # ---------------------------------------------------------------------------
 
-def default_threads() -> int:
-    return max(1, min(8, (os.cpu_count() or 2) // 2))
-
-
 class ExpertStore:
     def __init__(self, sources: list, fmt: str = "f32", lru_size: int = 0,
                  threads: int | None = None, gs: int = 64):
@@ -410,7 +428,9 @@ class ExpertStore:
         self.lru_size = lru_size
         self.pinned: dict[ExpertKey, Expert] = {}
         self.lru: OrderedDict[ExpertKey, Expert] = OrderedDict()
-        self.mapped: dict[ExpertKey, Expert] = {}  # zero-copy views, OS page cache does the caching
+        self.mapped: dict[ExpertKey, Expert] = {}
+        self.gpu = None       # accel.GpuTier when a GPU holds some of this node's experts
+        self.gpu_info = None  # its stats, also when calibration decided not to use it  # zero-copy views, OS page cache does the caching
         self.hits = 0
         self.misses = 0
         self._lock = threading.Lock()
@@ -492,10 +512,73 @@ class ExpertStore:
 
         groups = list(groups)
         out = np.zeros_like(x, dtype=np.float32)
-        # numba kernels parallelize inside each matmul (and their thread pool is
-        # not re-entrant), so with them the experts run one after another.
-        parallel = self._pool and len(groups) > 1 and not kernels.ENABLED
-        it = self._pool.map(one, groups) if parallel else map(one, groups)
-        for rows, y in it:
-            out[rows] += y  # a token picks an expert at most once
+        handle = None
+        if self.gpu is not None and self.gpu.experts:
+            on_gpu = [g for g in groups if (layer, int(g[0])) in self.gpu]
+            if on_gpu:   # queue the GPU's share first; the CPU computes the rest meanwhile
+                handle = self.gpu.launch(layer, x, on_gpu)
+                groups = [g for g in groups if (layer, int(g[0])) not in self.gpu]
+                self.hits += len(on_gpu)
+        self._compute_cpu(layer, x, groups, out, one)
+        if handle is not None:
+            self.gpu.collect(handle, out)
         return out
+
+    def _compute_cpu(self, layer, x, groups, out, one) -> None:
+        if not kernels.ENABLED:
+            it = self._pool.map(one, groups) if self._pool and len(groups) > 1 else map(one, groups)
+            for rows, y in it:
+                out[rows] += y  # a token picks an expert at most once
+            return
+        # With the kernels: experts with many rows (prompt reading) are widened
+        # by a single-threaded kernel and multiplied by BLAS, several at once on
+        # threads; the rest use the parallel kernels, which are not re-entrant,
+        # so they run one after another afterwards.
+        big = [g for g in groups if len(g[1]) >= kernels.BLAS_FROM]
+        small = [g for g in groups if len(g[1]) < kernels.BLAS_FROM]
+        if big:
+            it = self._pool.map(one, big) if self._pool and len(big) > 1 else map(one, big)
+            for rows, y in it:
+                out[rows] += y
+        for rows, y in map(one, small):
+            out[rows] += y
+
+    def setup_gpu(self, spec: str, budget: int, candidates, heat=None, mode: str = "auto",
+                  progress=None) -> dict:
+        """Put some of ``candidates`` (this node's experts) on a GPU. ``auto``
+        measures both devices and gives the GPU the hottest experts up to its
+        fair share of the routed work; ``max`` fills the budget hottest-first."""
+        from .accel import GpuTier, choose_gpu_experts
+        candidates = [tuple(k) for k in candidates]
+        if not candidates or budget <= 0:
+            return {}
+        tier = GpuTier(spec, budget)
+        sample = candidates[0]
+        share = tier.calibrate(self._read(sample), lambda xx: self.get(sample)(xx),
+                               hidden=self._read(sample).down.dequant().shape[0])
+        top_k = getattr(getattr(self.sources[0], "cfg", None), "top_k", 8) if self.sources else 8
+        if mode == "max":
+            share = 1.0
+        elif tier.gpu_ms > top_k * tier.cpu_ms:
+            # one expert on the GPU takes longer than the CPU needs for a whole
+            # layer's experts: any layer touching the GPU would wait for it
+            if progress:
+                progress(f"{tier.name}: {tier.gpu_ms:.2f} ms per expert vs CPU {tier.cpu_ms:.2f} ms "
+                         f"(x{top_k} per layer {top_k * tier.cpu_ms:.2f} ms) - slower than the CPU, "
+                         f"not used (--gpu-mode max forces it)")
+            self.gpu = None
+            self.gpu_info = dict(tier.stats(), experts=0, share=0.0)
+            return self.gpu_info
+        chosen = choose_gpu_experts(candidates, heat, share)
+        placed = 0
+        for key in chosen:
+            if not tier.add(key, self._read(key)):
+                break
+            placed += 1
+        if progress:
+            progress(f"{tier.name}: {tier.gpu_ms:.2f} ms per expert vs CPU {tier.cpu_ms:.2f} ms -> "
+                     f"GPU share {share:.0%}; {placed} experts on the GPU "
+                     f"({tier.used / 2**30:.2f} of {budget / 2**30:.2f} GiB)")
+        self.gpu = tier if placed else None
+        self.gpu_info = tier.stats()
+        return self.gpu_info

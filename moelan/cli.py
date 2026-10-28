@@ -11,8 +11,19 @@ from pathlib import Path
 from . import __version__
 
 
+def _add_gpu_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--gpu", choices=["none", "auto", "cuda", "mps", "dml", "torch-cpu"], default="none",
+                   help="hybrid mode: also compute experts on this GPU (needs PyTorch; dml = "
+                        "torch-directml for AMD/Intel GPUs on Windows)")
+    p.add_argument("--gpu-budget", default="4G", help="GPU memory for experts (fp16), e.g. 6G")
+    p.add_argument("--gpu-mode", choices=["auto", "max"], default="auto",
+                   help="auto: measure GPU vs CPU and give the GPU its fair share of the hot "
+                        "experts; max: fill the budget")
+
+
 def _add_cluster_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--model", required=True, help="HF checkpoint directory (safetensors)")
+    _add_gpu_args(p)
     p.add_argument("--workers", default="", help="comma-separated host:port list")
     p.add_argument("--discover", type=float, default=0.0, metavar="SECONDS",
                    help="find workers on the LAN by UDP broadcast for this long")
@@ -33,6 +44,13 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
                    help="routing statistics file: read to place hot experts first, updated after the run "
                         "(default: the model's colibri .coli_usage, read only)")
     p.add_argument("--lru", type=int, default=64, help="experts kept in the coordinator's disk-stream LRU")
+
+
+def _gpu_kw(args) -> dict:
+    from .worker import parse_size
+    if args.gpu == "none":
+        return {}
+    return {"gpu": args.gpu, "gpu_budget": parse_size(args.gpu_budget, 0), "gpu_mode": args.gpu_mode}
 
 
 def build_model(args):
@@ -60,13 +78,13 @@ def build_model(args):
               f"({'hottest pinned in RAM, ' if budget else ''}the rest computed from the memory-mapped checkpoint)")
         model = MoEModel(args.model, lru_size=args.lru, expert_format=args.expert_format,
                          pin_budget=budget, heat=heat, progress=print,
-                         dense_format=args.dense_format)
+                         dense_format=args.dense_format, **_gpu_kw(args))
     else:
         backend = DistributedBackend(args.model, cfg, workers,
                                      local_budget=budget, heat=heat,
                                      fmt=args.expert_format, wire=args.wire,
                                      replicate=not args.no_replicate, lru_size=args.lru,
-                                     progress=print)
+                                     progress=print, **_gpu_kw(args))
         model = MoEModel(args.model, backend=backend, dense_format=args.dense_format)
     return model
 
@@ -77,7 +95,8 @@ def cmd_worker(args) -> None:
     kernels.warn_if_slow()
     serve(host=args.host, port=args.port, budget=parse_size(args.budget, None) if args.budget else None,
           cache_root=args.cache, model_dir=args.model, node_id=args.name,
-          advertise=not args.no_advertise, lru_size=args.lru, threads=args.threads)
+          advertise=not args.no_advertise, lru_size=args.lru, threads=args.threads,
+          **_gpu_kw(args))
 
 
 def cmd_discover(args) -> None:
@@ -178,7 +197,7 @@ def cmd_serve(args) -> None:
     from .tokenizer import Tokenizer
     model = build_model(args)
     serve_http(model, Tokenizer(args.model), Path(args.model).name, args.host, args.port,
-               max_batch=args.max_batch)
+               max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens)
     model.backend.close()
 
 
@@ -225,6 +244,7 @@ def main(argv=None) -> None:
     p.add_argument("--no-advertise", action="store_true", help="do not broadcast discovery beacons")
     p.add_argument("--lru", type=int, default=0, help="extra non-assigned experts cached in RAM")
     p.add_argument("--threads", type=int, default=None, help="expert compute threads")
+    _add_gpu_args(p)
     p.set_defaults(fn=cmd_worker)
 
     p = sub.add_parser("discover", help="list workers broadcasting on the LAN")
@@ -262,6 +282,8 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--max-batch", type=int, default=4,
                    help="requests decoded together (1 = one at a time)")
+    p.add_argument("--prompt-cache-tokens", type=int, default=4096,
+                   help="tokens of recent conversations kept to reuse shared prompt starts (0 = off)")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("monitor", help="dashboard of worker health, without loading a model")

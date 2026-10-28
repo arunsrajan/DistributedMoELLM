@@ -255,11 +255,29 @@ class KVCache:
         self.v[layer][:, start:start + n] = v
         return self.k[layer][:, :start + n], self.v[layer][:, :start + n]
 
+    def clone(self, length: int) -> "KVCache":
+        """A new cache holding the first ``length`` positions of this one."""
+        length = min(length, self.length)
+        c = KVCache(self.cfg, capacity=max(256, length + 64))
+        for dst, src in ((c.k, self.k), (c.v, self.v)):
+            for i, a in enumerate(src):
+                dst[i][:, :length] = a[:, :length]
+        c.length = length
+        return c
+
+    @property
+    def nbytes(self) -> int:
+        return sum(a.nbytes for a in self.k) + sum(a.nbytes for a in self.v)
+
+    def bytes_per_token(self) -> int:
+        return self.nbytes // max(self.cap, 1)
+
 
 class MoEModel:
     def __init__(self, model_dir: str | Path, backend: ExpertBackend | None = None,
                  lru_size: int = 0, expert_format: str | None = None, pin_budget: int = 0,
-                 heat: Counter | None = None, progress=None, dense_format: str = "auto"):
+                 heat: Counter | None = None, progress=None, dense_format: str = "auto",
+                 gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto"):
         self.model_dir = Path(model_dir)
         self.cfg = cfg = load_config(model_dir)
         if dense_format == "auto":  # stored 16-bit is exact and halves traffic, with the kernels
@@ -345,6 +363,10 @@ class MoEModel:
                 if progress:
                     progress(f"pinning {min(n, len(order))} of {len(order)} experts as {fmt}")
                 store.pin(order[:n])
+            if gpu:   # hybrid: the hottest experts on the GPU, the rest on the CPU
+                store.setup_gpu(gpu, gpu_budget, [(l, e) for l in cfg.moe_layers()
+                                                  for e in range(cfg.num_experts)],
+                                heat=heat, mode=gpu_mode, progress=progress)
             backend = LocalBackend(store)
         self.backend = backend
 
@@ -421,12 +443,12 @@ class MoEModel:
         for a, b, cache in segs:
             m, pos = b - a, positions[a:b]
             K, V = cache.append(layer, k[a:b].transpose(1, 0, 2), v[a:b].transpose(1, 0, 2), int(pos[0]))
-            qg = q[a:b].transpose(1, 0, 2).reshape(KV, g, m, hd)
-            scores = np.einsum("kgnd,ktd->kgnt", qg, K) * (1.0 / math.sqrt(hd))  # python float: stays f32
+            qg = q[a:b].transpose(1, 0, 2).reshape(KV, g * m, hd)        # heads sharing a KV head stacked
+            scores = (qg @ K.transpose(0, 2, 1)) * (1.0 / math.sqrt(hd))  # (KV, g*m, T); python float: f32
             mask = np.arange(K.shape[1])[None, :] > pos[:, None]          # (m, T) causal
-            scores = np.where(mask[None, None], -np.inf, scores)
+            scores = np.where(np.tile(mask, (g, 1))[None], -np.inf, scores)
             probs = softmax(scores, axis=-1)
-            o = np.einsum("kgnt,ktd->kgnd", probs, V)                     # (KV, g, m, hd)
+            o = (probs @ V).reshape(KV, g, m, hd)                         # (KV, g, m, hd)
             out[a:b] = o.reshape(H, m, hd).transpose(1, 0, 2)
         return _mm(out.reshape(n, H * hd), L["o"])
 

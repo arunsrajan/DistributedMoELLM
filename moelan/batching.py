@@ -9,6 +9,11 @@ expert that several requests picked decodes its weights once for all of them.
 
 Requests join and leave between steps; a long prompt being read delays the
 other requests' next token by that prefill.
+
+A prompt cache keeps the KV caches of recent conversations. A new prompt that
+starts like one of them (the same system prompt and tool list, or the next
+turn of the same chat) copies the shared part and only reads the rest, which
+matters for agents whose tool definitions run to hundreds of tokens.
 """
 
 from __future__ import annotations
@@ -40,6 +45,8 @@ class GenRequest:
         self.stop = set(stop_ids)
         self.out: queue.Queue = queue.Queue()
         self.cache = None
+        self.cached = 0       # prompt tokens reused from the prompt cache
+        self.fed: list[int] = []
         self.last = None
         self.generated = 0
         self.done = False
@@ -56,8 +63,67 @@ class GenRequest:
             yield item
 
 
+class PromptCache:
+    """KV caches of finished conversations, keyed by the tokens they hold.
+    Least recently used entries go first once ``max_tokens`` is exceeded."""
+
+    def __init__(self, max_tokens: int = 4096, min_match: int = 8):
+        self.max_tokens = max_tokens
+        self.min_match = min_match
+        self.entries: list[tuple[np.ndarray, object]] = []   # most recently used last
+        self.lock = threading.Lock()
+        self.hits = 0
+        self.lookups = 0
+        self.tokens_saved = 0
+
+    def lookup(self, ids):
+        """(cache holding the longest cached prefix of ``ids``, its length) or
+        (None, 0). At least one prompt token is always left to compute."""
+        a = np.asarray(ids, dtype=np.int64)
+        with self.lock:
+            self.lookups += 1
+            best, best_len = None, 0
+            for i, (toks, _) in enumerate(self.entries):
+                n = min(len(a) - 1, len(toks))
+                if n <= best_len:
+                    continue
+                diff = np.flatnonzero(a[:n] != toks[:n])
+                common = int(diff[0]) if diff.size else n
+                if common > best_len:
+                    best, best_len = i, common
+            if best is None or best_len < self.min_match:
+                return None, 0
+            entry = self.entries.pop(best)
+            self.entries.append(entry)
+            self.hits += 1
+            self.tokens_saved += best_len
+            return entry[1].clone(best_len), best_len
+
+    def store(self, tokens, cache) -> None:
+        if self.max_tokens <= 0:
+            return
+        toks = np.asarray(tokens, dtype=np.int64)[:cache.length]
+        if len(toks) < self.min_match or len(toks) > self.max_tokens:
+            return
+        compact = cache.clone(len(toks))
+        with self.lock:
+            # an entry that is a prefix of the new one is now redundant
+            self.entries = [(t, c) for t, c in self.entries
+                            if not (len(t) <= len(toks) and np.array_equal(toks[:len(t)], t))]
+            self.entries.append((toks, compact))
+            while sum(len(t) for t, _ in self.entries) > self.max_tokens:
+                self.entries.pop(0)
+
+    def stats(self) -> dict:
+        with self.lock:
+            return {"entries": len(self.entries), "tokens": int(sum(len(t) for t, _ in self.entries)),
+                    "max_tokens": self.max_tokens, "hits": self.hits, "lookups": self.lookups,
+                    "tokens_saved": self.tokens_saved}
+
+
 class Batcher(threading.Thread):
-    def __init__(self, model: MoEModel, telemetry=None, max_batch: int = 4):
+    def __init__(self, model: MoEModel, telemetry=None, max_batch: int = 4,
+                 prompt_cache_tokens: int = 4096):
         super().__init__(daemon=True, name="moelan-batcher")
         self.model = model
         self.tel = telemetry
@@ -66,6 +132,7 @@ class Batcher(threading.Thread):
         self.running: list[GenRequest] = []
         self.steps = 0
         self.batch_sizes = 0  # sum over steps, for the average batch size
+        self.pcache = PromptCache(prompt_cache_tokens)
 
     def submit(self, req: GenRequest) -> GenRequest:
         self.pending.put(req)
@@ -98,11 +165,16 @@ class Batcher(threading.Thread):
                 self.running = []
 
     def _prefill(self, reqs: list[GenRequest]) -> None:
+        todo = []
         for r in reqs:
-            r.cache = self.model.new_cache()
+            cache, hit = self.pcache.lookup(r.ids)
+            r.cache = cache if cache is not None else self.model.new_cache()
+            r.cached = hit
+            r.fed = list(r.ids)
+            todo.append(r.ids[hit:])
             if self.tel:
-                self.tel.admit(r.rid)
-        logits = self.model.forward_batch([r.ids for r in reqs], [r.cache for r in reqs])
+                self.tel.admit(r.rid, cached=hit)
+        logits = self.model.forward_batch(todo, [r.cache for r in reqs])
         for r, lg in zip(reqs, logits):
             self._emit(r, lg)
 
@@ -114,6 +186,8 @@ class Batcher(threading.Thread):
         live = [r for r in live if not r.done]
         if not live:
             return
+        for r in live:
+            r.fed.append(r.last)
         logits = self.model.forward_batch([[r.last] for r in live], [r.cache for r in live])
         self.steps += 1
         self.batch_sizes += len(live)
@@ -132,6 +206,11 @@ class Batcher(threading.Thread):
 
     def _finish(self, r: GenRequest, error: BaseException | None = None) -> None:
         r.done = True
+        if error is None and r.cache is not None:
+            try:
+                self.pcache.store(r.fed, r.cache)
+            except Exception:  # the cache is an optimisation; never fail a request over it
+                log.exception("prompt cache store failed")
         r.cache = None  # free the KV cache now, not when the client reads the end
         r.out.put(error)
         if self.tel:
@@ -140,4 +219,5 @@ class Batcher(threading.Thread):
     def stats(self) -> dict:
         return {"max_batch": self.max_batch, "running": len(self.running),
                 "waiting": self.pending.qsize(), "steps": self.steps,
-                "avg_batch": self.batch_sizes / self.steps if self.steps else 0.0}
+                "avg_batch": self.batch_sizes / self.steps if self.steps else 0.0,
+                "prompt_cache": self.pcache.stats()}

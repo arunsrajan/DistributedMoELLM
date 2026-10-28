@@ -73,7 +73,12 @@ that already fits.
   int4/int8 group-scaled mat-vec straight from the packed bytes, ~13x faster
   than the pure-numpy fallback.
 * **OpenAI-compatible API** (`moelan serve`): `/v1/chat/completions` (with
-  streaming), `/v1/completions`, `/v1/models`.
+  streaming), `/v1/completions`, `/v1/models`, including **tool / function
+  calling** (`tools`, `tool_choice: "none"`, `tool_calls` in replies and in
+  streams) and a **prompt cache** that reuses the shared start of a
+  conversation.
+* **Hybrid CPU + GPU experts** (`--gpu cuda|mps|dml|auto`): each node can put
+  its hottest experts on a GPU and compute them alongside the CPU.
 * **Monitoring dashboard** at `http://<host>:<port>/` of `moelan serve` (see
   below), and `moelan monitor` for watching workers without loading a model.
 * **Safe wire format.** JSON header + raw numpy bytes; no pickle.
@@ -236,6 +241,65 @@ help more, since the per-layer round trips, not compute, dominate there
 (estimate, not yet measured on separate machines). `--max-batch 1` restores
 one-at-a-time serving.
 
+### Tool calling
+
+`/v1/chat/completions` accepts OpenAI `tools`. They go into the prompt through
+the model's own chat template, and the model's tool-call output is turned back
+into `tool_calls` with `finish_reason: "tool_calls"`. Understood formats:
+Qwen3-Coder XML (`<tool_call><function=...><parameter=...>`), Qwen / Hermes
+JSON (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`) and DeepSeek V3
+(`<｜tool▁calls▁begin｜>...`). XML parameters are converted to the types the
+tool's JSON schema declares. When streaming, text is sent as it comes but
+nothing from a tool-call tag on, and the parsed calls arrive as `tool_calls`
+deltas at the end. `tool_choice: "none"` leaves the tools out of the prompt;
+forcing a specific tool (`"required"`, a named function) is not enforced,
+since that needs constrained decoding.
+
+Agents re-send the whole conversation, tool list included, every turn. The
+**prompt cache** (`--prompt-cache-tokens`, default 4096) keeps the KV caches
+of recent conversations; a new prompt that starts the same way copies that
+part and only reads the rest. Measured on Qwen3-Coder-30B, a two-turn
+weather-tool exchange:
+
+| | prompt tokens | read from cache | prompt reading | answer |
+|---|---|---|---|---|
+| turn 1 | 327 | 0 | 30.1 s | `get_weather {"city": "Paris", "days": 2}` |
+| turn 2 (tool result) | 423 | 358 | 11.7 s | final answer from the tool's data |
+
+Reading long prompts also got about 1.9x faster (317 tokens: 43.8 s -> 23.5
+s): experts that get many prompt rows are widened once and multiplied with
+BLAS on parallel threads, long-prompt 16-bit matrices are split across
+threads, and attention uses batched matmul instead of `einsum`.
+
+### Hybrid CPU + GPU experts
+
+```bash
+python -m moelan serve --model ... --gpu auto --gpu-budget 6G        # this machine
+python -m moelan worker --gpu cuda --gpu-budget 10G                 # a worker with an NVIDIA card
+```
+
+Every node (the coordinator and each worker) can keep part of its experts on
+a GPU through PyTorch: CUDA, Apple MPS, DirectML (`pip install
+torch-directml`, AMD / Intel GPUs on Windows), or `torch-cpu` for testing.
+For each MoE layer the GPU's experts are launched first, the CPU computes the
+rest meanwhile, and the results are added; output is the same as CPU-only.
+
+`--gpu-mode auto` (default) times one expert on each device at start-up. The
+GPU then gets the hottest experts (by routing statistics) until it carries
+its fair share of the routed work, `cpu / (gpu + cpu)`, so both finish a layer
+together; if the GPU needs longer for one expert than the CPU for a whole
+layer's experts, it is not used at all. `--gpu-mode max` fills the budget
+regardless. The coordinator sends each worker the routing heat of its
+experts, so workers pick their own hot set. The dashboard's node table shows
+each node's GPU, its experts, memory and measured speed.
+
+Measured on this laptop's integrated Radeon (DirectML, Qwen3-Coder-30B): the
+GPU needs 7.6 ms per expert against 0.48 ms on the CPU, so `auto` declines
+it (2.41 tok/s, same as CPU only), and forcing 2 GB of experts onto it costs
+speed (1.75 tok/s). A discrete NVIDIA GPU runs an expert in well under a
+millisecond, which is where the hybrid mode is meant to pay off; that has not
+been measured here, as this machine has none.
+
 ## 5. Layout
 
 | File | Role |
@@ -251,7 +315,9 @@ one-at-a-time serving.
 | `moelan/coordinator.py` | distributed backend: setup, transfer, per-layer fan-out, failover |
 | `moelan/discovery.py` | UDP broadcast discovery |
 | `moelan/server.py` | OpenAI-compatible HTTP API, dashboard feeds, worker monitor |
-| `moelan/batching.py` | continuous batching scheduler for concurrent requests |
+| `moelan/batching.py` | continuous batching scheduler and prompt cache |
+| `moelan/tools.py` | tool calling: message normalization, tool-call parsing, safe streaming |
+| `moelan/accel.py` | GPU expert tier (CUDA / MPS / DirectML via PyTorch), calibration, hot-set choice |
 | `moelan/dashboard.html` | the monitoring dashboard (one self-contained page) |
 | `moelan/tiny.py` | random tiny checkpoint for tests |
 

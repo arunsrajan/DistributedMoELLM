@@ -71,9 +71,16 @@ class WorkerConn:
             raise RuntimeError(f"{self.address}: {h.get('error', 'request failed')}")
         return h, arrays
 
-    def call(self, header, arrays=None, blobs=None):
-        self.send(header, arrays, blobs)
-        return self.recv()
+    def call(self, header, arrays=None, blobs=None, timeout: float | None = None):
+        if timeout is None:
+            self.send(header, arrays, blobs)
+            return self.recv()
+        self.sock.settimeout(timeout)   # e.g. a worker filling a large GPU budget
+        try:
+            self.send(header, arrays, blobs)
+            return self.recv()
+        finally:
+            self.sock.settimeout(self.timeout)
 
     def mark_failed(self, exc: Exception) -> None:
         log.warning("worker %s failed: %s; its experts fall back to the coordinator", self.address, exc)
@@ -100,8 +107,10 @@ class DistributedBackend(ExpertBackend):
     def __init__(self, model_dir: str, cfg: ModelConfig, workers: list[str],
                  local_budget: int = 0, heat=None, fmt: str | None = None,
                  wire: str = "f32", replicate: bool = True, lru_size: int = 0,
-                 progress=None):
+                 progress=None, gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto"):
         super().__init__()
+        self.heat_in = dict(heat or {})
+        self.gpu_spec, self.gpu_budget, self.gpu_mode = gpu, gpu_budget, gpu_mode
         if wire not in ("f32", "f16"):
             raise ValueError("wire must be f32 or f16")
         self.cfg = cfg
@@ -140,7 +149,8 @@ class DistributedBackend(ExpertBackend):
     def _setup_worker(self, c: WorkerConn) -> None:
         keys = self.plan.per_node.get(c.node_id, [])
         h, _ = c.call({"op": "assign", "fingerprint": self.fingerprint, "config": self.cfg.raw,
-                       "meta": self.meta, "experts": [list(k) for k in keys], "format": self.fmt})
+                       "meta": self.meta, "experts": [list(k) for k in keys], "format": self.fmt,
+                       "heat": [int(self.heat_in.get(k, 0)) for k in keys]})
         missing = [tuple(k) for k in h["missing"]]
         if missing:
             mb = len(missing) * self.source.nbytes(missing[0]) / 2**20
@@ -163,8 +173,12 @@ class DistributedBackend(ExpertBackend):
             if acked % 256 == 0:
                 rate = nbytes / (time.perf_counter() - t0) / 2**20
                 self.progress(f"{c.node_id}: {acked}/{len(missing)} experts sent, {rate:.0f} MiB/s")
-        h, _ = c.call({"op": "load", "fingerprint": self.fingerprint})
+        h, _ = c.call({"op": "load", "fingerprint": self.fingerprint}, timeout=900)
         c.resident_bytes = h["resident_bytes"]
+        c.gpu = h.get("gpu") or {}
+        if c.gpu.get("experts"):
+            self.progress(f"{c.node_id}: {c.gpu['experts']} experts on {c.gpu['device']} "
+                          f"(GPU share {c.gpu['share']:.0%})")
         self.progress(f"{c.node_id}: {len(keys)} experts resident "
                       f"({h['resident_bytes'] / 2**30:.2f} GiB, loaded in {h['load_s']:.1f}s)")
 
@@ -178,6 +192,10 @@ class DistributedBackend(ExpertBackend):
                     except (OSError, RuntimeError, ConnectionError) as exc:
                         c.mark_failed(exc)
         self.local.pin(self.plan.per_node.get(LOCAL, []))
+        if self.gpu_spec:   # the coordinator computes its own experts and the unplaced ones
+            mine = list(self.plan.per_node.get(LOCAL, [])) + list(self.plan.unplaced)
+            self.local.setup_gpu(self.gpu_spec, self.gpu_budget, mine, heat=self.heat_in,
+                                 mode=self.gpu_mode, progress=self.progress)
 
     def _maybe_reconnect(self) -> None:
         now = time.monotonic()
@@ -268,12 +286,13 @@ class DistributedBackend(ExpertBackend):
                    "requests": c.requests, "mib_out": c.bytes_out / 2**20, "wait_s": c.wait_s,
                    "compute_s": c.remote_s, "budget_bytes": c.info.get("budget_bytes"),
                    "cpus": c.info.get("cpus"), "resident_bytes": c.resident_bytes,
-                   "kernels": c.info.get("kernels")}
+                   "kernels": c.info.get("kernels"), "gpu": getattr(c, "gpu", None) or None}
             out.append(row)
         out.append({"node": LOCAL, "address": "-", "alive": True,
                     "experts": len(self.plan.per_node.get(LOCAL, [])),
                     "disk_reads": self.local.misses, "hits": self.local.hits,
-                    "resident_bytes": self.local.resident_bytes()})
+                    "resident_bytes": self.local.resident_bytes(),
+                    "gpu": self.local.gpu.stats() if self.local.gpu else self.local.gpu_info})
         return out
 
     def close(self) -> None:

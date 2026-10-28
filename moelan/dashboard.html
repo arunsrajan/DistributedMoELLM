@@ -277,8 +277,8 @@ function renderNodes(nodes) {
   // Workers compute in parallel; the coordinator collects replies in turn, so
   // "waited" is time the coordinator spent blocked on that node specifically.
   const maxBusy = Math.max(1e-9, ...nodes.map(n => n.compute_s || 0));
-  const head = el("tr", {}, ...["Node", "Address", "Status", "Experts", "RAM used / budget", "CPUs", "Requests", "MiB sent", "Worker compute (s)", "Coordinator waited (s)", ""]
-    .map((h, i) => el("th", { class: i >= 3 && i < 10 && i !== 4 ? "num" : "" }, h)));
+  const head = el("tr", {}, ...["Node", "Address", "Status", "Experts", "RAM used / budget", "CPUs", "GPU", "Requests", "MiB sent", "Worker compute (s)", "Coordinator waited (s)", ""]
+    .map((h, i) => el("th", { class: i >= 3 && i < 11 && i !== 4 && i !== 6 ? "num" : "" }, h)));
   const rows = nodes.map(n => {
     const ram = n.resident_bytes != null ? gib(n.resident_bytes) + (n.budget_bytes ? " / " + gib(n.budget_bytes) : "") : "–";
     const extra = n.node === "local" ? `disk reads ${int(n.disk_reads)} · RAM hits ${int(n.hits)}`
@@ -290,6 +290,8 @@ function renderNodes(nodes) {
       el("td", { class: "num" }, int(n.experts)),
       el("td", {}, ram),
       el("td", { class: "num" }, n.cpus ?? "–"),
+      el("td", { title: n.gpu ? `${fmt(n.gpu.gpu_ms_per_expert, 2)} ms per expert on the GPU vs ${fmt(n.gpu.cpu_ms_per_expert, 2)} ms on the CPU` : "" },
+        n.gpu && n.gpu.experts ? `${n.gpu.device} · ${int(n.gpu.experts)} experts · ${gib(n.gpu.used_bytes)}` : (n.gpu ? `${n.gpu.device}: not used` : "–")),
       el("td", { class: "num" }, n.requests != null ? int(n.requests) : "–"),
       el("td", { class: "num" }, n.mib_out != null ? fmt(n.mib_out, 1) : "–"),
       el("td", { class: "num" }, n.compute_s != null ? fmt(n.compute_s, 2) : "–"),

@@ -72,9 +72,12 @@ def parse_size(s: str | int | None, default: int) -> int:
 
 class WorkerState:
     def __init__(self, node_id: str, budget: int, cache_root: Path,
-                 model_dir: str | None = None, lru_size: int = 0, threads: int | None = None):
+                 model_dir: str | None = None, lru_size: int = 0, threads: int | None = None,
+                 gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto"):
         self.node_id = node_id
         self.threads = threads
+        self.gpu, self.gpu_budget, self.gpu_mode = gpu, gpu_budget, gpu_mode
+        self.heat: dict = {}
         self.budget = budget
         self.cache_root = Path(cache_root)
         self.lru_size = lru_size
@@ -117,7 +120,7 @@ class WorkerState:
                     cached[d.name] = sum(1 for _ in d.glob("L*_E*.safetensors"))
         from . import kernels
         return {"node_id": self.node_id, "version": __version__, "protocol": PROTOCOL_VERSION,
-                "kernels": "numba" if kernels.ENABLED else "numpy",
+                "kernels": "numba" if kernels.ENABLED else "numpy", "gpu": self.gpu,
                 "budget_bytes": self.budget, "cpus": os.cpu_count(), "cached": cached,
                 "local_model": self.local_fp}
 
@@ -160,6 +163,7 @@ class _Handler(socketserver.BaseRequestHandler):
             store = st.store_for(h["fingerprint"], h.get("config"), h.get("meta"), h.get("format", "int8"))
             keys = [tuple(k) for k in h["experts"]]
             st.assigned[h["fingerprint"]] = keys
+            st.heat[h["fingerprint"]] = h.get("heat") or []
             missing = [list(k) for k in keys if not store.can_serve(k)]
             return {"ok": True, "missing": missing}, None
         if op == "put":
@@ -175,8 +179,15 @@ class _Handler(socketserver.BaseRequestHandler):
             store.unpin_all_except(keys)
             t0 = time.perf_counter()
             store.pin(keys)
+            gpu = {}
+            if st.gpu and store.gpu is None:   # hybrid: hottest assigned experts to the GPU
+                heat = dict(zip(keys, st.heat.get(fp, [])))
+                gpu = store.setup_gpu(st.gpu, st.gpu_budget, keys, heat=heat, mode=st.gpu_mode,
+                                      progress=log.info)
+            elif store.gpu_info is not None:
+                gpu = store.gpu.stats() if store.gpu else store.gpu_info
             return {"ok": True, "resident_bytes": store.resident_bytes(),
-                    "load_s": time.perf_counter() - t0}, None
+                    "load_s": time.perf_counter() - t0, "gpu": gpu}, None
         if op == "moe":
             t0 = time.perf_counter()
             store = st.stores[h["fingerprint"]]
@@ -197,7 +208,8 @@ class _Handler(socketserver.BaseRequestHandler):
             return {"ok": True, "requests": st.requests, "busy_s": st.busy_s,
                     "stores": {fp: {"pinned": len(s.pinned), "hits": s.hits, "misses": s.misses,
                                     "resident_bytes": s.resident_bytes()}
-                               for fp, s in st.stores.items()}}, None
+                               for fp, s in st.stores.items()},
+                    "gpu": {fp: s.gpu.stats() for fp, s in st.stores.items() if s.gpu}}, None
         raise ValueError(f"unknown op {op!r}")
 
 
@@ -209,12 +221,14 @@ class _Server(socketserver.ThreadingTCPServer):
 def serve(host: str = "0.0.0.0", port: int = 9100, budget: int | None = None,
           cache_root: str | None = None, model_dir: str | None = None,
           node_id: str | None = None, advertise: bool = True, lru_size: int = 0,
-          threads: int | None = None,
+          threads: int | None = None, gpu: str | None = None, gpu_budget: int = 0,
+          gpu_mode: str = "auto",
           ready: threading.Event | None = None, stop: threading.Event | None = None) -> None:
     budget = budget if budget is not None else int(total_ram_bytes() * 0.6)
     cache_root = Path(cache_root or Path.home() / ".moelan" / "cache")
     node_id = node_id or f"{socket.gethostname()}:{port}"
-    state = WorkerState(node_id, budget, cache_root, model_dir, lru_size, threads)
+    state = WorkerState(node_id, budget, cache_root, model_dir, lru_size, threads,
+                        gpu=gpu, gpu_budget=gpu_budget, gpu_mode=gpu_mode)
     handler = type("Handler", (_Handler,), {"state": state})
     server = _Server((host, port), handler)
     port = server.server_address[1]
