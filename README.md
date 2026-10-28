@@ -219,6 +219,42 @@ reliable win is capacity: a model whose experts do not fit in one machine's
 RAM (Qwen3-235B-A22B, ~120 GB int4) runs from RAM across several machines
 instead of from disk.
 
+### Speed-aware placement (`--placement speed`, the default)
+
+Splitting experts by RAM alone gives a slower or more distant worker a share
+it cannot keep up with, and every layer then waits for it. So at start-up the
+coordinator measures:
+
+* each node's time per expert (`bench`: synthetic experts of the model's shape
+  and format, one input row, cycled so they come from RAM);
+* each worker's real round trip (`echo` with a one-row payload in the chosen
+  `--wire` format, so serialization and the network are included).
+
+A layer of a generated token takes `max(local picks x local ms, rtt + worker
+picks x worker ms)`, where the 8 picks per layer land on nodes at random in
+proportion to their shares. The planner chooses the shares with the lowest
+*expected* layer time, which accounts for a small share still costing a full
+round trip in most layers, and spreads routing heat (not expert counts) in
+those proportions. A worker is used only if it makes a layer at least 10%
+faster; a worker on the coordinator's own machine is never counted as extra
+speed (it shares the CPU). The decisions are printed and shown in the
+dashboard's "Speed placement" column. `--placement ram` restores the old
+split; experts the coordinator takes are computed from its memory-mapped
+checkpoint (pinned only within `--local-budget`).
+
+Measured on Qwen3-Coder-30B with a 6 GB worker (here on the same laptop),
+generating:
+
+| Link | RAM placement | speed placement | coordinator alone |
+|---|---|---|---|
+| Wi-Fi, 3 ms | 2.07 tok/s | 3.24 tok/s (worker not used) | 3.13 tok/s |
+| wired, 0.3 ms | 2.25 tok/s | 3.06 tok/s (worker not used) | 3.13 tok/s |
+
+Text identical in all cases. A worker that genuinely helps needs its own CPU
+and a fast link; for an equally fast machine 0.3 ms away the planner gives it
+about 40% of the routed work and expects a layer about 30% faster (not yet
+measured on two real machines).
+
 ### Compressing the network traffic (`--wire`)
 
 Per token and MoE layer each worker gets the token's hidden state (2048

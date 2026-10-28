@@ -41,6 +41,10 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
                    help="activations on the network: f32 (exact), f16 (half the bytes, ~0.02%% "
                         "error), int8 (a quarter, ~0.4%% error); matters for long prompts on slow links")
     p.add_argument("--no-replicate", action="store_true", help="do not replicate hot experts")
+    p.add_argument("--placement", choices=["speed", "ram"], default="speed",
+                   help="speed: measure every node and its round trip and share the experts so all "
+                        "finish a layer together, dropping workers that would only slow it down; "
+                        "ram: split by RAM budget only")
     p.add_argument("--heat", default=None,
                    help="routing statistics file: read to place hot experts first, updated after the run "
                         "(default: the model's colibri .coli_usage, read only)")
@@ -85,7 +89,7 @@ def build_model(args):
                                      local_budget=budget, heat=heat,
                                      fmt=args.expert_format, wire=args.wire,
                                      replicate=not args.no_replicate, lru_size=args.lru,
-                                     progress=print, **_gpu_kw(args))
+                                     progress=print, placement=args.placement, **_gpu_kw(args))
         model = MoEModel(args.model, backend=backend, dense_format=args.dense_format)
     return model
 

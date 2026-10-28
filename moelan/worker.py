@@ -121,6 +121,7 @@ class WorkerState:
         from . import kernels
         return {"node_id": self.node_id, "version": __version__, "protocol": PROTOCOL_VERSION,
                 "kernels": "numba" if kernels.ENABLED else "numpy", "gpu": self.gpu,
+                "host": socket.gethostname(),
                 "budget_bytes": self.budget, "cpus": os.cpu_count(), "cached": cached,
                 "local_model": self.local_fp}
 
@@ -157,6 +158,11 @@ class _Handler(socketserver.BaseRequestHandler):
             return dict(st.hello(), ok=True), None
         if op == "ping":
             return {"ok": True, "t": time.time()}, None
+        if op == "echo":     # round trip with a realistic payload, for speed-aware placement
+            return {"ok": True}, dict(arrays)
+        if op == "bench":    # ms per expert on this machine, before it holds any experts
+            from .experts import bench_expert
+            return {"ok": True, "ms": bench_expert(h["hidden"], h["inter"], h["format"], h.get("gs", 64))}, None
         if op == "bye":
             return {"ok": True}, None
         if op == "assign":

@@ -10,6 +10,15 @@ Rules, in order:
   3. Leftover capacity replicates the hottest experts on a second node, which
      gives both failover and a choice of replica to balance load.
 Experts that fit nowhere are served by the coordinator, streamed from disk.
+
+Speed-aware placement (the default when the coordinator can measure its
+workers): instead of RAM alone, each node's share of the routed work follows
+its measured speed. For one generated token a layer takes, on a worker,
+``rtt + picks * expert_ms`` (it gets one request per layer, if any of its
+experts were picked), and on the coordinator ``picks * expert_ms`` (it
+computes its own experts while waiting). :func:`speed_shares` picks the
+shares with the lowest expected layer time; a worker that cannot make a layer
+clearly faster gets no experts at all.
 """
 
 from __future__ import annotations
@@ -49,13 +58,66 @@ class Plan:
         return "\n".join(lines)
 
 
+def speed_shares(top_k: int, local_ms: float, workers: dict[str, tuple[float, float, float]],
+                 min_gain: float = 1.10, samples: int = 4000):
+    """Shares of the routed work that make a generated token fastest.
+
+    ``workers``: node id -> (ms per expert, round-trip ms, largest share its
+    RAM allows). A layer routes ``top_k`` picks; with shares p each node gets a
+    multinomial number of them. The coordinator computes its picks while the
+    workers compute theirs, and a worker that got any picks costs its round
+    trip, so a layer takes max(local picks x local ms, rtt_w + picks_w x ms_w).
+    Shares are chosen to minimise the *expected* layer time (sampled), which
+    accounts for a small share still costing a full round trip in most layers.
+    Workers are used only if they speed a layer up by ``min_gain`` or more.
+    Returns (shares by node id incl. ``LOCAL``, expected ms per layer, ms per
+    layer with everything on the coordinator)."""
+    import numpy as np
+    alone = top_k * local_ms
+    ids = list(workers)
+    if not ids:
+        return {LOCAL: 1.0}, alone, alone
+    ms = np.array([workers[i][0] for i in ids])
+    rtt = np.array([workers[i][1] for i in ids])
+    caps = np.array([workers[i][2] for i in ids])
+
+    def expected(p):
+        probs = np.concatenate([[max(0.0, 1.0 - p.sum())], p])
+        picks = np.random.default_rng(0).multinomial(top_k, probs / probs.sum(), size=samples)
+        local = picks[:, 0] * local_ms
+        remote = np.where(picks[:, 1:] > 0, rtt + picks[:, 1:] * ms, 0.0)
+        return float(np.maximum(local, remote.max(axis=1)).mean())
+
+    p = np.zeros(len(ids))
+    best = expected(p)
+    for _ in range(3):                                   # coordinate search over a share grid
+        for j in range(len(ids)):
+            room = min(caps[j], 1.0 - (p.sum() - p[j]))
+            for cand in np.linspace(0.0, max(room, 0.0), 41):
+                q = p.copy()
+                q[j] = cand
+                t = expected(q)
+                if t < best - 1e-9:
+                    best, p = t, q
+    if best * min_gain > alone:                          # not worth the risk: keep it all here
+        p, best = np.zeros(len(ids)), alone
+    shares = {i: float(v) for i, v in zip(ids, p)}
+    shares[LOCAL] = 1.0 - float(p.sum())
+    return shares, best, alone
+
+
 def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
               nodes: dict[str, int], heat: dict[ExpertKey, float] | None = None,
-              replicate: bool = True) -> Plan:
+              replicate: bool = True, shares: dict[str, float] | None = None) -> Plan:
     """Place ``layers x num_experts`` experts of ``expert_bytes`` each on ``nodes``
-    (node id -> RAM budget in bytes)."""
+    (node id -> RAM budget in bytes). With ``shares`` (node id -> fraction of
+    the routed work, e.g. from :func:`speed_shares`) each layer's routing heat
+    is split in those proportions instead of by RAM; nodes with a zero share get
+    nothing."""
     heat = heat or {}
     pool = {nid: Node(nid, b) for nid, b in nodes.items() if b > 0}
+    if shares is not None:
+        pool = {nid: n for nid, n in pool.items() if shares.get(nid, 0) > 1e-9}
     owners: dict[ExpertKey, list[str]] = {}
     unplaced: list[ExpertKey] = []
     total_budget = sum(n.budget_bytes for n in pool.values()) or 1
@@ -63,7 +125,14 @@ def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
     # Visit experts hottest first; ties keep a layer-major order.
     order = sorted(((l, e) for l in layers for e in range(num_experts)),
                    key=lambda k: (-heat.get(k, 0.0), k[0], k[1]))
-    per_layer_count: dict[tuple[int, str], int] = {}
+    per_layer_count: dict[tuple[int, str], float] = {}
+    # with shares, balance routing heat (what actually costs time), smoothed so
+    # experts never seen still count a little
+    mean_heat = (sum(heat.values()) / len(heat)) if heat else 0.0
+
+    def weight(key) -> float:
+        return heat.get(key, 0.0) + 0.05 * mean_heat + (1.0 if not heat else 0.0)
+    layer_mean = {l: sum(weight((l, e)) for e in range(num_experts)) / num_experts for l in layers}
 
     for key in order:
         layer = key[0]
@@ -71,9 +140,10 @@ def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
         for n in pool.values():
             if n.free < expert_bytes:
                 continue
-            # how far this node is above its fair share of this layer
-            share = n.budget_bytes / total_budget * num_experts
-            score = per_layer_count.get((layer, n.node_id), 0) / share
+            # how far above its fair share of this layer the node would be with this expert
+            share = (shares[n.node_id] if shares is not None else n.budget_bytes / total_budget) * num_experts
+            add = weight(key) / layer_mean[layer] if shares is not None else 0.0
+            score = (per_layer_count.get((layer, n.node_id), 0) + add) / share
             if best is None or score < best_score - 1e-9 or (
                     abs(score - best_score) <= 1e-9 and n.free > best.free):
                 best, best_score = n, score
@@ -82,7 +152,8 @@ def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
             continue
         best.used_bytes += expert_bytes
         best.experts.append(key)
-        per_layer_count[(layer, best.node_id)] = per_layer_count.get((layer, best.node_id), 0) + 1
+        per_layer_count[(layer, best.node_id)] = per_layer_count.get((layer, best.node_id), 0) + (
+            weight(key) / layer_mean[layer] if shares is not None else 1)
         owners[key] = [best.node_id]
 
     if replicate and len(pool) > 1 and not unplaced:

@@ -5,7 +5,14 @@ import numpy as np
 import pytest
 
 from moelan.config import load_config
-from moelan.coordinator import DistributedBackend
+from moelan.coordinator import DistributedBackend as _DistributedBackend
+
+
+def DistributedBackend(*args, **kwargs):
+    """These tests check the distribution mechanics, so they place by RAM
+    unless they ask otherwise (speed placement has its own tests)."""
+    kwargs.setdefault("placement", "ram")
+    return _DistributedBackend(*args, **kwargs)
 from moelan.experts import QuantMatrix
 from moelan.model import MoEModel, rms_norm, group_by_expert, route
 from moelan.planner import LOCAL, make_plan
@@ -1016,6 +1023,74 @@ def test_distributed_wire_formats_stay_close(tiny, tmp_path, wire, tol):
         assert np.abs(out - ref).max() <= tol * np.abs(ref).max()
         row = next(r for r in backend.stats() if r["node"] == f"w-{wire}")
         assert row["mib_in"] > 0 and row["mib_out"] > 0
+        backend.close()
+    finally:
+        w.kill()
+
+
+# --- speed-aware placement ------------------------------------------------------------
+
+from moelan.planner import speed_shares
+
+
+def test_speed_shares_balance_and_drop():
+    # an equally fast worker 0.3 ms away: takes a large share, layer gets faster
+    sh, t, alone = speed_shares(8, 0.5, {"near": (0.5, 0.3, 1.0)})
+    assert abs(sum(sh.values()) - 1) < 1e-9 and 0.25 < sh["near"] < 0.6 and t < 0.8 * alone
+    # 10 ms away: the whole layer takes 4 ms here, so waiting for it can never pay
+    sh, t, alone = speed_shares(8, 0.5, {"far": (0.5, 10.0, 1.0)})
+    assert sh["far"] == 0 and sh[LOCAL] == 1 and t == pytest.approx(alone)
+    # 1.5 ms away: a small share would still cost a round trip in most layers
+    sh, _, _ = speed_shares(8, 0.45, {"meh": (0.45, 1.5, 1.0)})
+    assert sh["meh"] == 0 or sh["meh"] > 0.2
+    # a slow worker gets less than a fast one; a RAM cap is respected
+    sh, _, _ = speed_shares(8, 0.5, {"fast": (0.5, 0.3, 1.0), "slow": (2.0, 0.3, 1.0), "tiny": (0.5, 0.3, 0.05)})
+    assert sh["slow"] <= sh["fast"] and sh["tiny"] <= 0.05 + 1e-9
+
+
+def test_make_plan_follows_shares():
+    heat = {(0, e): (30 if e < 4 else 10) for e in range(16)}     # a few hot experts, the rest warm
+    plan = make_plan([0], 16, 1, {"w": 10**6, LOCAL: 10**6, "off": 10**6}, heat=heat,
+                     replicate=False, shares={"w": 0.25, LOCAL: 0.75, "off": 0.0})
+    assert "off" not in plan.per_node
+    total = sum(heat.values())
+    w_heat = sum(heat[k] for k in plan.per_node["w"]) / total
+    assert 0.18 < w_heat < 0.32         # about a quarter of the routing heat, not a quarter of experts
+    assert len(plan.per_node["w"]) + len(plan.per_node[LOCAL]) == 16
+
+
+def test_speed_placement_drops_a_worker_too_far_away(tiny, tmp_path, monkeypatch):
+    import moelan.coordinator as coord
+    prompt = [256] + list(b"far away")
+    ref = greedy(MoEModel(tiny), prompt)
+    w = Worker(tmp_path, "far", 2**22)
+    monkeypatch.setattr(coord, "_SIM_NET", (0.025, 1e9))      # 50 ms round trip
+    monkeypatch.setattr(coord, "_this_host", lambda: "coordinator-box")   # the worker counts as another machine
+    try:
+        msgs = []
+        backend = _DistributedBackend(str(tiny), load_config(tiny), [w.address], placement="speed",
+                                      progress=msgs.append)
+        assert not backend.plan.per_node.get("far")             # nothing placed on it
+        assert any("not used" in m for m in msgs)
+        row = next(r for r in backend.stats() if r["node"] == "far")
+        assert row["speed"]["share"] == 0 and row["speed"]["rtt_ms"] > 40
+        monkeypatch.setattr(coord, "_SIM_NET", None)
+        assert greedy(MoEModel(tiny, backend=backend), prompt) == ref
+        assert row["requests"] == 0
+        backend.close()
+    finally:
+        w.kill()
+
+
+def test_speed_placement_ignores_a_worker_on_the_same_machine(tiny, tmp_path):
+    w = Worker(tmp_path, "twin", 2**22)          # in-process: same host name as the coordinator
+    try:
+        msgs = []
+        backend = _DistributedBackend(str(tiny), load_config(tiny), [w.address], placement="speed",
+                                      progress=msgs.append)
+        assert not backend.plan.per_node.get("twin") and any("on this machine" in m for m in msgs)
+        row = next(r for r in backend.stats() if r["node"] == "twin")
+        assert row["speed"] == {"share": 0.0, "same_host": True}
         backend.close()
     finally:
         w.kill()

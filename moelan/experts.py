@@ -299,6 +299,39 @@ def default_format(cfg: ModelConfig) -> str:
     return "f32"
 
 
+def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48) -> float:
+    """Milliseconds for one expert on one input row (as when generating), in
+    resident format ``fmt``, on this machine. Synthetic weights of the model's
+    shape, so a node can be measured before it holds any experts; several
+    distinct experts are cycled so the weights come from RAM, not the CPU
+    cache, as they do when generating."""
+    import time
+    rng = np.random.default_rng(0)
+    gs = gs if hidden % gs == 0 and inter % gs == 0 else hidden
+
+    def mat(o, i):
+        if fmt == "int4":
+            return Packed4(rng.integers(0, 256, (o, i // 2), dtype=np.uint8),
+                           (rng.random((o, i // gs), dtype=np.float32) * 1e-3), gs, (o, i))
+        if fmt == "int8":
+            return GroupQuant(rng.integers(-127, 128, (o, i), dtype=np.int8),
+                              (rng.random((o, i // gs), dtype=np.float32) * 1e-4), gs)
+        return F32Matrix((rng.standard_normal((o, i)) * 0.02).astype(np.float32))
+    one = 3 * hidden * inter * {"int4": 0.5, "int8": 1, "f32": 4}.get(fmt, 4)
+    experts = [Expert(mat(2 * inter, hidden), mat(hidden, inter), inter)
+               for _ in range(max(2, min(12, int(48 * 2**20 // one) + 1)))]
+    x = (rng.standard_normal((1, hidden)) * 0.1).astype(np.float32)
+    for e in experts:
+        e(x)
+    rounds = []
+    for _ in range(3):          # median of three rounds: laptops change clock speed a lot
+        t0 = time.perf_counter()
+        for i in range(reps):
+            experts[i % len(experts)](x)
+        rounds.append((time.perf_counter() - t0) / reps * 1000)
+    return float(np.median(rounds))
+
+
 def resident_bytes(cfg: ModelConfig, fmt: str) -> int:
     """RAM one routed expert takes in ``fmt``."""
     n = 3 * cfg.hidden_size * cfg.moe_intermediate_size
