@@ -1094,3 +1094,35 @@ def test_speed_placement_ignores_a_worker_on_the_same_machine(tiny, tmp_path):
         backend.close()
     finally:
         w.kill()
+
+
+from moelan.planner import node_ms
+
+
+def test_node_ms_combines_cpu_and_gpu():
+    assert node_ms(1.0) == 1.0                                         # no GPU
+    assert node_ms(1.0, 0.25, 10**6) == pytest.approx(0.2)              # both busy: 1*0.25/(1.25)
+    capped = node_ms(1.0, 0.25, gpu_experts=100, node_experts=1000)     # GPU holds only 10% of them
+    assert capped == pytest.approx(0.9) and capped < 1.0
+    assert node_ms(0.5, 7.6, 10**6, top_k=8) == 0.5                    # slower than a whole CPU layer: ignored
+
+
+def test_speed_placement_counts_gpus(tiny, tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    import moelan.coordinator as coord
+    monkeypatch.setattr(coord, "_this_host", lambda: "coordinator-box")
+    w = Worker(tmp_path, "gpuw", 2**22, gpu="torch-cpu", gpu_budget=2**30, gpu_mode="auto")
+    try:
+        msgs = []
+        backend = _DistributedBackend(str(tiny), load_config(tiny), [w.address], placement="speed",
+                                      gpu="torch-cpu", gpu_budget=2**30, progress=msgs.append)
+        rows = {r["node"]: r for r in backend.stats()}
+        sp = rows["gpuw"]["speed"]
+        assert sp["gpu"]["gpu_name"].startswith("torch-cpu") and sp["gpu"]["gpu_experts"] > 0
+        assert sp["expert_ms"] <= sp["cpu_ms"] + 1e-9                    # the GPU can only help
+        local = rows["local"]["speed"]
+        assert local["gpu"]["gpu_name"].startswith("torch-cpu")         # the coordinator's GPU counted too
+        assert any("torch-cpu" in m and "per expert" in m for m in msgs)
+        backend.close()
+    finally:
+        w.kill()

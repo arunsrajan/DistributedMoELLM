@@ -299,14 +299,9 @@ def default_format(cfg: ModelConfig) -> str:
     return "f32"
 
 
-def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48) -> float:
-    """Milliseconds for one expert on one input row (as when generating), in
-    resident format ``fmt``, on this machine. Synthetic weights of the model's
-    shape, so a node can be measured before it holds any experts; several
-    distinct experts are cycled so the weights come from RAM, not the CPU
-    cache, as they do when generating."""
-    import time
-    rng = np.random.default_rng(0)
+def synthetic_expert(hidden: int, inter: int, fmt: str, gs: int = 64, rng=None) -> Expert:
+    """A random expert of the given shape and resident format (for benchmarks)."""
+    rng = rng or np.random.default_rng(0)
     gs = gs if hidden % gs == 0 and inter % gs == 0 else hidden
 
     def mat(o, i):
@@ -317,8 +312,19 @@ def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48
             return GroupQuant(rng.integers(-127, 128, (o, i), dtype=np.int8),
                               (rng.random((o, i // gs), dtype=np.float32) * 1e-4), gs)
         return F32Matrix((rng.standard_normal((o, i)) * 0.02).astype(np.float32))
+    return Expert(mat(2 * inter, hidden), mat(hidden, inter), inter)
+
+
+def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48) -> float:
+    """Milliseconds for one expert on one input row (as when generating), in
+    resident format ``fmt``, on this machine. Synthetic weights of the model's
+    shape, so a node can be measured before it holds any experts; several
+    distinct experts are cycled so the weights come from RAM, not the CPU
+    cache, as they do when generating."""
+    import time
+    rng = np.random.default_rng(0)
     one = 3 * hidden * inter * {"int4": 0.5, "int8": 1, "f32": 4}.get(fmt, 4)
-    experts = [Expert(mat(2 * inter, hidden), mat(hidden, inter), inter)
+    experts = [synthetic_expert(hidden, inter, fmt, gs, rng)
                for _ in range(max(2, min(12, int(48 * 2**20 // one) + 1)))]
     x = (rng.standard_normal((1, hidden)) * 0.1).astype(np.float32)
     for e in experts:

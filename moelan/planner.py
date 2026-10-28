@@ -58,6 +58,22 @@ class Plan:
         return "\n".join(lines)
 
 
+def node_ms(cpu_ms: float, gpu_ms: float | None = None, gpu_experts: int = 0,
+            node_experts: float = 0.0, top_k: int = 8) -> float:
+    """Effective ms per routed expert for a node with a CPU and maybe a GPU.
+
+    The node splits its picks so both finish together: the GPU takes
+    ``cpu / (cpu + gpu)`` of them, but at most the share of the node's
+    ``node_experts`` that fit in its GPU (``gpu_experts``). A GPU slower than
+    the CPU's whole layer (the rule the GPU tier itself applies) is ignored."""
+    if not gpu_ms or gpu_experts <= 0 or gpu_ms > top_k * cpu_ms:
+        return cpu_ms
+    s = cpu_ms / (cpu_ms + gpu_ms)
+    if node_experts > 0:
+        s = min(s, gpu_experts / node_experts)
+    return max(s * gpu_ms, (1.0 - s) * cpu_ms)
+
+
 def speed_shares(top_k: int, local_ms: float, workers: dict[str, tuple[float, float, float]],
                  min_gain: float = 1.10, samples: int = 4000):
     """Shares of the routed work that make a generated token fastest.

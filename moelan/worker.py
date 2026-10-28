@@ -162,7 +162,15 @@ class _Handler(socketserver.BaseRequestHandler):
             return {"ok": True}, dict(arrays)
         if op == "bench":    # ms per expert on this machine, before it holds any experts
             from .experts import bench_expert
-            return {"ok": True, "ms": bench_expert(h["hidden"], h["inter"], h["format"], h.get("gs", 64))}, None
+            out = {"ok": True, "ms": bench_expert(h["hidden"], h["inter"], h["format"], h.get("gs", 64))}
+            if st.gpu:       # and on its GPU, so placement counts the GPU too
+                from .accel import bench_gpu
+                try:
+                    out.update(bench_gpu(st.gpu, st.gpu_budget, h["hidden"], h["inter"], h["format"],
+                                         h.get("gs", 64)))
+                except RuntimeError as exc:
+                    out["gpu_error"] = str(exc)
+            return out, None
         if op == "bye":
             return {"ok": True}, None
         if op == "assign":

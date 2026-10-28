@@ -274,6 +274,13 @@ function renderActive(g, batch) {
   box.replaceChildren(summary, el("div", { class: "table-wrap" }, el("table", {}, head, ...rows)));
 }
 
+function gpuNote(sp) {   // a GPU that counted in the speed placement
+  if (!sp.gpu) return "";
+  return sp.expert_ms < sp.cpu_ms - 1e-9
+    ? ` (CPU ${fmt(sp.cpu_ms, 2)} + ${sp.gpu.gpu_name.split(":")[0]} ${fmt(sp.gpu.gpu_ms, 2)})`
+    : ` (GPU too slow to help)`;
+}
+
 function renderNodes(nodes) {
   const t = $("nodes");
   if (!nodes.length) { t.replaceChildren(el("tr", {}, el("td", { class: "empty" }, "No nodes yet."))); return; }
@@ -295,10 +302,10 @@ function renderNodes(nodes) {
       el("td", { class: "num" }, int(n.experts)),
       el("td", { title: n.speed && n.speed.layer_ms ? `expected ${fmt(n.speed.layer_ms, 1)} ms per layer for the experts, ${fmt(n.speed.layer_ms_alone, 1)} ms on this machine alone` : "" },
         !n.speed ? "–" : n.node === "local"
-          ? `${fmt(n.speed.expert_ms, 2)} ms/expert · ${Math.round(100 * n.speed.share)}% of work`
+          ? `${fmt(n.speed.expert_ms, 2)} ms/expert${gpuNote(n.speed)} · ${Math.round(100 * n.speed.share)}% of work`
           : n.speed.same_host ? "not used: same machine as the coordinator (shares its CPU)"
           : n.speed.share > 0
-            ? `${fmt(n.speed.expert_ms, 2)} ms/expert · round trip ${fmt(n.speed.rtt_ms, 1)} ms · ${Math.round(100 * n.speed.share)}% of work`
+            ? `${fmt(n.speed.expert_ms, 2)} ms/expert${gpuNote(n.speed)} · round trip ${fmt(n.speed.rtt_ms, 1)} ms · ${Math.round(100 * n.speed.share)}% of work`
             : `not used: round trip ${fmt(n.speed.rtt_ms, 1)} ms costs more than it saves`),
       el("td", {}, ram),
       el("td", { class: "num" }, n.cpus ?? "–"),

@@ -26,7 +26,7 @@ import numpy as np
 from .config import ModelConfig, model_fingerprint
 from .experts import CheckpointSource, ExpertStore, bench_expert, default_format, resident_bytes
 from .model import ExpertBackend, group_by_expert
-from .planner import LOCAL, Plan, make_plan, speed_shares
+from .planner import LOCAL, Plan, make_plan, node_ms, speed_shares
 from .protocol import (PROTOCOL_VERSION, WIRE_FORMATS, decode_rows, encode_rows, recv_msg, send_msg,
                        tune_socket)
 
@@ -187,8 +187,18 @@ class DistributedBackend(ExpertBackend):
         dims = {"hidden": cfg.hidden_size, "inter": cfg.moe_intermediate_size, "format": self.fmt,
                 "gs": cfg.expert_gs or 64}
         local_ms = bench_expert(dims["hidden"], dims["inter"], self.fmt, dims["gs"])
+        local_gpu = {}
+        if self.gpu_spec:   # this machine's GPU counts too
+            from .accel import bench_gpu
+            try:
+                local_gpu = bench_gpu(self.gpu_spec, self.gpu_budget, dims["hidden"], dims["inter"],
+                                      self.fmt, dims["gs"])
+            except RuntimeError as exc:
+                self.progress(f"this machine's GPU: {exc}")
         total = self.expert_ram * len(cfg.moe_layers()) * cfg.num_experts
+        n_experts = len(cfg.moe_layers()) * cfg.num_experts
         workers = {}
+        gpus = {}
         row = encode_rows(np.zeros((1, cfg.hidden_size), np.float32), self.wire, "x")
         for nid, c in self.conns.items():
             if c.info.get("host") == _this_host():
@@ -198,7 +208,12 @@ class DistributedBackend(ExpertBackend):
                 self.speed.setdefault("same_host", []).append(nid)
                 continue
             try:
-                ms = c.call({"op": "bench", **dims}, timeout=600)[0]["ms"]
+                bench = c.call({"op": "bench", **dims}, timeout=600)[0]
+                ms = bench["ms"]
+                if bench.get("gpu_ms"):
+                    gpus[nid] = bench
+                elif bench.get("gpu_error"):
+                    self.progress(f"{nid}: GPU not usable ({bench['gpu_error']})")
                 for _ in range(3):
                     c.call({"op": "echo"}, row)
                 rtts = []
@@ -211,20 +226,49 @@ class DistributedBackend(ExpertBackend):
                 self.progress(f"{nid}: could not measure ({exc}); not used")
                 continue
             workers[nid] = (ms, rtt, min(1.0, budgets.get(nid, 0) / total))
-        shares, layer_ms, alone_ms = speed_shares(cfg.top_k, local_ms, workers)
+        # Solve with each GPU at full speed, then again with its share checked
+        # against how many experts its memory holds.
+        cpu_only = dict(workers)
+
+        def effective(shares):
+            eff = {}
+            for nid, (ms, rtt, cap) in cpu_only.items():
+                g = gpus.get(nid, {})
+                held = shares.get(nid, 0.0) * n_experts if shares else 0.0
+                eff[nid] = (node_ms(ms, g.get("gpu_ms"), g.get("gpu_experts", 0), held, cfg.top_k), rtt, cap)
+            held = shares.get(LOCAL, 1.0) * n_experts if shares else 0.0
+            local = node_ms(local_ms, local_gpu.get("gpu_ms"), local_gpu.get("gpu_experts", 0), held, cfg.top_k)
+            return local, eff
+        local_eff, workers = effective(None)
+        shares, _, _ = speed_shares(cfg.top_k, local_eff, workers)
+        local_eff, workers = effective(shares)
+        shares, layer_ms, _ = speed_shares(cfg.top_k, local_eff, workers)
+        alone_ms = cfg.top_k * local_eff       # this machine on its own, with its GPU if any
         same_host = self.speed.get("same_host", [])
-        self.speed = {"local_ms": local_ms, "layer_ms": layer_ms, "layer_ms_alone": alone_ms,
+        self.speed = {"local_ms": local_eff, "local_cpu_ms": local_ms, "local_gpu": local_gpu or None,
+                      "layer_ms": layer_ms, "layer_ms_alone": alone_ms,
                       "same_host": same_host,
-                      "nodes": {nid: {"expert_ms": w[0], "rtt_ms": w[1], "share": shares.get(nid, 0.0)}
+                      "nodes": {nid: {"expert_ms": w[0], "cpu_ms": cpu_only[nid][0], "rtt_ms": w[1],
+                                      "share": shares.get(nid, 0.0),
+                                      "gpu": ({k: gpus[nid][k] for k in ("gpu_ms", "gpu_experts", "gpu_name")}
+                                              if nid in gpus else None)}
                                 for nid, w in workers.items()}}
-        self.progress(f"this machine: {local_ms:.2f} ms per expert -> {alone_ms:.1f} ms per layer alone")
+
+        def describe(cpu, eff, g):
+            if not g:
+                return f"{cpu:.2f} ms per expert"
+            used = "" if eff < cpu - 1e-9 else " (GPU too slow to help)"
+            return (f"CPU {cpu:.2f} + {g['gpu_name']} {g['gpu_ms']:.2f} ms per expert "
+                    f"({g['gpu_experts']} fit) -> {eff:.2f} ms{used}")
+        self.progress(f"this machine: {describe(local_ms, local_eff, local_gpu)} -> "
+                      f"{alone_ms:.1f} ms per layer alone")
         for nid, (ms, rtt, cap) in workers.items():
             sh = shares.get(nid, 0.0)
+            what = describe(cpu_only[nid][0], ms, gpus.get(nid))
             if sh > 1e-9:
-                self.progress(f"{nid}: {ms:.2f} ms per expert, round trip {rtt:.2f} ms -> "
-                              f"{sh:.0%} of the routed work")
+                self.progress(f"{nid}: {what}, round trip {rtt:.2f} ms -> {sh:.0%} of the routed work")
             else:
-                self.progress(f"{nid}: {ms:.2f} ms per expert, round trip {rtt:.2f} ms -> not used: "
+                self.progress(f"{nid}: {what}, round trip {rtt:.2f} ms -> not used: "
                               f"waiting for it costs more than computing its share here")
         gain = alone_ms / layer_ms if layer_ms > 0 else 1.0
         self.progress(f"expected {layer_ms:.1f} ms per layer for the experts "
@@ -390,7 +434,8 @@ class DistributedBackend(ExpertBackend):
                     "disk_reads": self.local.misses, "hits": self.local.hits,
                     "resident_bytes": self.local.resident_bytes(),
                     "gpu": self.local.gpu.stats() if self.local.gpu else self.local.gpu_info,
-                    "speed": ({"expert_ms": self.speed["local_ms"], "share": 1.0 - sum(
+                    "speed": ({"expert_ms": self.speed["local_ms"], "cpu_ms": self.speed.get("local_cpu_ms"),
+                               "gpu": self.speed.get("local_gpu"), "share": 1.0 - sum(
                         n["share"] for n in self.speed["nodes"].values()),
                         "layer_ms": self.speed["layer_ms"], "layer_ms_alone": self.speed["layer_ms_alone"]}
                         if self.speed else None)})

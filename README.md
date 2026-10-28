@@ -250,6 +250,20 @@ generating:
 | Wi-Fi, 3 ms | 2.07 tok/s | 3.24 tok/s (worker not used) | 3.13 tok/s |
 | wired, 0.3 ms | 2.25 tok/s | 3.06 tok/s (worker not used) | 3.13 tok/s |
 
+**GPUs count too.** A node started with `--gpu` (workers, or the coordinator
+via `run` / `serve`) also times one expert on its GPU in the benchmark and
+reports how many experts fit in `--gpu-budget`. The planner turns CPU + GPU
+into one effective time per expert: the node splits its picks so both finish
+together (`cpu x gpu / (cpu + gpu)`), but the GPU takes at most the part of
+the node's experts that fit in its memory, so it solves once at full GPU
+speed and again with each node's share checked against its GPU capacity. A
+GPU slower than the CPU's whole layer is ignored, the same rule the GPU tier
+applies. Startup prints e.g. `worker: CPU 0.45 + cuda: RTX 3060 0.08 ms per
+expert (600 fit) -> 0.07 ms, round trip 0.4 ms -> 52% of the routed work`, and
+the dashboard shows it in the "Speed placement" column. On this laptop's
+Radeon (DirectML) the GPU measures 7.5 ms per expert against 0.31 ms on the
+CPU, so it is correctly left out; a discrete NVIDIA GPU is where this counts.
+
 Text identical in all cases. A worker that genuinely helps needs its own CPU
 and a fast link; for an equally fast machine 0.3 ms away the planner gives it
 about 40% of the routed work and expects a layer about 30% faster (not yet

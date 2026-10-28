@@ -163,6 +163,20 @@ class GpuTier:
                 "calls": self.calls, "busy_s": round(self.busy_s, 3)}
 
 
+def bench_gpu(spec: str, budget: int, hidden: int, inter: int, fmt: str, gs: int = 64) -> dict:
+    """GPU side of a node's speed benchmark: ms per expert on the GPU (one input
+    row, transfers included) and how many experts fit in ``budget``. Raises
+    RuntimeError if the device cannot be opened."""
+    from .experts import synthetic_expert
+    tier = GpuTier(spec, budget)
+    e = synthetic_expert(hidden, inter, fmt, gs)
+    tier.calibrate(e, lambda x: e(x), hidden)
+    out = {"gpu_ms": tier.gpu_ms, "gpu_experts": int(budget // tier.expert_bytes(inter, hidden)),
+           "gpu_name": tier.name}
+    tier.experts.clear()
+    return out
+
+
 def choose_gpu_experts(candidates, heat, share: float, per_layer_cap: int | None = None):
     """Hottest experts per layer until they cover ``share`` of that layer's
     routed picks (by ``heat`` counts; uniform when there are none)."""
