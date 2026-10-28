@@ -213,6 +213,29 @@ reliable win is capacity: a model whose experts do not fit in one machine's
 RAM (Qwen3-235B-A22B, ~120 GB int4) runs from RAM across several machines
 instead of from disk.
 
+### Several conversations at once (batching)
+
+`moelan serve` decodes concurrent requests together (`--max-batch`, default
+4). Each step runs every running conversation's next token through the
+weights in one pass, and each MoE layer is one request per worker for the
+whole batch, so the 48 round trips per step are shared. New requests join
+between steps; a long prompt being read delays the others by that prefill.
+
+Measured on the same laptop, Qwen3-Coder-30B, one machine:
+
+| Conversations at once | Total tok/s | Per conversation |
+|---|---|---|
+| 1 | 3.5 | 3.5 |
+| 2 | 4.5 | 2.3 |
+| 4 | 5.3 | 1.3 |
+| 8 | 5.4 | 0.7 |
+
+On one machine the gain stops near 1.5x: conversations mostly pick different
+experts, so expert work grows with the batch. Across a LAN batching should
+help more, since the per-layer round trips, not compute, dominate there
+(estimate, not yet measured on separate machines). `--max-batch 1` restores
+one-at-a-time serving.
+
 ## 5. Layout
 
 | File | Role |
@@ -228,6 +251,7 @@ instead of from disk.
 | `moelan/coordinator.py` | distributed backend: setup, transfer, per-layer fan-out, failover |
 | `moelan/discovery.py` | UDP broadcast discovery |
 | `moelan/server.py` | OpenAI-compatible HTTP API, dashboard feeds, worker monitor |
+| `moelan/batching.py` | continuous batching scheduler for concurrent requests |
 | `moelan/dashboard.html` | the monitoring dashboard (one self-contained page) |
 | `moelan/tiny.py` | random tiny checkpoint for tests |
 
@@ -244,10 +268,10 @@ checkpoints (they agree to about 1e-5).
 * Verify logits against HF transformers / colibri's reference on real weights
   (so far: coherent output on Qwen3-Coder-30B and exact agreement with an HF
   twin on synthetic int4 models).
-* Hide the per-layer round trip: speculative routing / prefetch of the next
-  layer's experts, and pipelining several sequences.
-* Router-lookahead prefetch and speculative routing to hide the per-layer round trip.
-* Pipelining several sequences (batch decoding) to fill the network gaps.
+* Hide the per-layer round trip: router-lookahead prefetch of the next
+  layer's experts, and overlapping one batch's attention with another's
+  expert requests.
+* Measure batching across separate machines on wired Ethernet.
 * Optional faster kernels (int4, numba/torch when present) on workers.
 * Run DeepSeek-V2-Lite (16B, BF16) end to end on real weights; FP8 block
   dequantization for the official DeepSeek-V3 / Kimi K2 files.

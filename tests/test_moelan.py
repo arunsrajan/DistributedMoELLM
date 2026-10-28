@@ -323,15 +323,21 @@ def _serve(server):
 def test_telemetry_tracks_requests():
     tel = Telemetry()
     tel.begin("r1", 5)
+    tel.begin("r2", 3)
     snap = tel.snapshot()
-    assert snap["busy"] and snap["active"]["phase"] == "prefill"
+    assert snap["busy"] and snap["running"] == 2
+    assert [a["phase"] for a in snap["active"]] == ["waiting", "waiting"]
+    tel.admit("r1")
+    assert tel.snapshot()["active"][0]["phase"] == "prefill"
     for _ in range(4):
-        tel.token()
-    assert tel.snapshot()["active"]["phase"] == "decode"
-    tel.end()
+        tel.token("r1")
+    assert tel.snapshot()["active"][0]["phase"] == "decode"
+    tel.end("r1")
     snap = tel.snapshot()
-    assert not snap["busy"] and snap["tokens_out"] == 4 and snap["tokens_in"] == 5
+    assert snap["running"] == 1 and snap["tokens_out"] == 4 and snap["tokens_in"] == 8
     assert snap["recent"][0]["completion_tokens"] == 4 and snap["rate_tok_s"] > 0
+    tel.end("r2")
+    assert not tel.snapshot()["busy"]
 
 
 def test_dashboard_and_status_api(tiny, tmp_path):
@@ -562,3 +568,101 @@ def test_dense_formats_agree(tiny):
         if ref is None:
             ref = out
         np.testing.assert_allclose(out, ref, atol=1e-4)  # bf16-stored weights: f16 path is exact
+
+
+# --- batched decoding --------------------------------------------------------------
+
+from moelan.batching import Batcher, GenRequest
+
+_PROMPTS = [[256] + list(b"one"), [256] + list(b"a longer second prompt"), [256, 72], [256] + list(b"fourth!")]
+
+
+def _separate_logits(model, prompts, steps):
+    """Each prompt alone: prefill, then ``steps`` greedy single-token steps."""
+    out = []
+    for p in prompts:
+        c = model.new_cache()
+        lg = [model.forward(p, c)]
+        for _ in range(steps):
+            lg.append(model.forward([int(np.argmax(lg[-1]))], c))
+        out.append(lg)
+    return out
+
+
+def _batched_logits(model, prompts, steps):
+    caches = [model.new_cache() for _ in prompts]
+    lg = [list(model.forward_batch(prompts, caches))]
+    for _ in range(steps):
+        lg.append(list(model.forward_batch([[int(np.argmax(v))] for v in lg[-1]], caches)))
+    return [[lg[t][i] for t in range(steps + 1)] for i in range(len(prompts))]
+
+
+def test_forward_batch_matches_separate(tiny):
+    m = MoEModel(tiny)
+    for sep, bat in zip(_separate_logits(m, _PROMPTS, 4), _batched_logits(m, _PROMPTS, 4)):
+        for a, b in zip(sep, bat):
+            np.testing.assert_allclose(b, a, atol=1e-4, rtol=1e-4)
+
+
+def test_forward_batch_matches_separate_deepseek(deepseek):
+    m = MoEModel(deepseek)
+    for sep, bat in zip(_separate_logits(m, _PROMPTS, 3), _batched_logits(m, _PROMPTS, 3)):
+        for a, b in zip(sep, bat):
+            np.testing.assert_allclose(b, a, atol=2e-4, rtol=1e-4)
+
+
+def test_forward_batch_distributed_one_request_per_layer(tiny, tmp_path):
+    w1, w2 = Worker(tmp_path, "b1", 2**20), Worker(tmp_path, "b2", 2**20)
+    try:
+        backend = DistributedBackend(str(tiny), load_config(tiny), [w1.address, w2.address],
+                                     replicate=False, progress=lambda m: None)
+        m = MoEModel(tiny, backend=backend)
+        ref = _separate_logits(MoEModel(tiny), _PROMPTS, 2)
+        caches = [m.new_cache() for _ in _PROMPTS]
+        m.forward_batch(_PROMPTS, caches)
+        before = sum(c.requests for c in backend.conns.values())
+        step = m.forward_batch([[int(np.argmax(r[0]))] for r in ref], caches)
+        sent = sum(c.requests for c in backend.conns.values()) - before
+        assert sent <= 2 * len(m.cfg.moe_layers())   # at most one per worker per layer, whole batch
+        for i, r in enumerate(ref):
+            np.testing.assert_allclose(step[i], r[1], atol=1e-4, rtol=1e-4)
+        backend.close()
+    finally:
+        w1.kill(), w2.kill()
+
+
+def test_batcher_gives_same_text_as_one_at_a_time(tiny):
+    m = MoEModel(tiny)
+    want = [list(m.generate(p, max_new_tokens=12, stop_ids=[])) for p in _PROMPTS]
+    b = Batcher(m, max_batch=8)
+    reqs = [GenRequest(f"r{i}", p, max_new_tokens=12) for i, p in enumerate(_PROMPTS)]
+    for r in reqs:
+        b.submit(r)            # all queued before the scheduler starts: one batch
+    b.start()
+    got = [list(r.tokens()) for r in reqs]
+    assert got == want
+    st = b.stats()
+    assert st["avg_batch"] > 3 and st["running"] == 0
+
+
+def test_server_batches_concurrent_requests(tiny):
+    from concurrent.futures import ThreadPoolExecutor
+    from moelan.tokenizer import Tokenizer
+    m = MoEModel(tiny)
+    server = make_server(m, Tokenizer(tiny), "tiny", port=0, max_batch=4)
+    _serve(server)
+    try:
+        prompts = ["alpha", "beta beta", "gamma", "delta delta delta"]
+
+        def ask(p):
+            return _json.loads(_http(server, "/v1/completions", {"prompt": p, "max_tokens": 16})[2])
+
+        alone = [ask(p)["choices"][0]["text"] for p in prompts]
+        with ThreadPoolExecutor(4) as ex:
+            together = [r["choices"][0]["text"] for r in ex.map(ask, prompts)]
+        assert together == alone
+        status = _json.loads(_http(server, "/api/status")[2])
+        assert status["batch"]["max_batch"] == 4 and status["gen"]["requests"] == 8
+        assert status["batch"]["avg_batch"] > 1  # the concurrent ones shared steps
+    finally:
+        server.shutdown()

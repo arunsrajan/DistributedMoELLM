@@ -112,7 +112,7 @@ button.primary:disabled { opacity: .5; cursor: default; }
       <canvas id="chart" height="180"></canvas>
     </section>
     <section class="card">
-      <h2>Current request</h2>
+      <h2>Running requests</h2>
       <div id="active"></div>
     </section>
   </div>
@@ -231,7 +231,7 @@ function render() {
   const alive = s.nodes.filter(n => n.alive).length;
   const pill = $("pill");
   if (alive < s.nodes.length) { pill.className = "pill down"; pill.textContent = `${s.nodes.length - alive} node(s) down`; }
-  else if (g.busy) { pill.className = "pill busy"; pill.textContent = g.active.phase === "prefill" ? "reading prompt" : "generating"; }
+  else if (g.busy) { pill.className = "pill busy"; const nrun = s.batch ? s.batch.running : g.running; pill.textContent = nrun > 1 ? `generating ×${nrun}` : (g.active[0].phase === "decode" ? "generating" : "reading prompt"); }
   else { pill.className = "pill idle"; pill.textContent = "idle"; }
 
   const last = g.recent[0];
@@ -239,7 +239,7 @@ function render() {
     ["Speed now", fmt(g.rate_tok_s, 2), "tokens / s"],
     ["Last request", last ? fmt(last.decode_tok_s, 2) : "–", last ? `decode tok/s · prefill ${fmt(last.prefill_s, 1)}s` : "decode tok/s"],
     ["Tokens generated", int(g.tokens_out), `${int(g.tokens_in)} prompt tokens read`],
-    ["Requests", int(g.requests), g.busy ? "1 running" : "none running"],
+    ["Requests", int(g.requests), !g.busy ? "none running" : s.batch ? `${s.batch.running} decoding · ${s.batch.waiting} waiting` : `${g.running} running`],
     ["Nodes", `${alive} / ${s.nodes.length}`, "alive"],
     ["Uptime", dur(g.uptime_s), s.moe_time_s ? `experts busy ${dur(s.moe_time_s)}` : ""],
   ];
@@ -247,7 +247,7 @@ function render() {
   $("kpis").replaceChildren(...kpis.map(([l, v, sub]) =>
     el("div", { class: "kpi" }, el("div", { class: "label" }, l), el("div", { class: "value" }, v), el("div", { class: "sub" }, sub))));
 
-  renderActive(g);
+  renderActive(g, s.batch);
   renderNodes(s.nodes);
   renderRecent(g.recent);
   drawChart();
@@ -255,14 +255,18 @@ function render() {
   $("chatCard").style.display = s.mode === "monitor" ? "none" : "";
 }
 
-function renderActive(g) {
+function renderActive(g, batch) {
   const box = $("active");
-  if (!g.busy) { box.replaceChildren(el("div", { class: "empty" }, "No request running.")); return; }
-  const a = g.active;
-  const rows = [["Phase", a.phase], ["Prompt tokens", int(a.prompt_tokens)], ["Generated", int(a.generated)],
-                ["Elapsed", fmt(a.elapsed_s, 1) + " s"], ["Decode speed", a.decode_tok_s ? fmt(a.decode_tok_s, 2) + " tok/s" : "–"]];
-  box.replaceChildren(el("dl", { class: "kv" }, ...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, v)])),
-                      el("div", { class: "mono muted", style: "margin-top:10px" }, a.id));
+  const summary = batch ? el("div", { class: "muted", style: "margin-bottom:8px;font-size:12px" },
+    `batch ${batch.running} / ${batch.max_batch} running · ${batch.waiting} waiting · ` +
+    `average batch ${fmt(batch.avg_batch, 1)} over ${int(batch.steps)} steps`) : "";
+  if (!g.busy) { box.replaceChildren(summary, el("div", { class: "empty" }, "No request running.")); return; }
+  const head = el("tr", {}, ...["Request", "Phase", "Prompt", "Generated", "tok/s"].map((h, i) => el("th", { class: i > 1 ? "num" : "" }, h)));
+  const rows = g.active.map(a => el("tr", {},
+    el("td", { class: "mono" }, a.id.slice(-6)), el("td", {}, a.phase),
+    el("td", { class: "num" }, int(a.prompt_tokens)), el("td", { class: "num" }, int(a.generated)),
+    el("td", { class: "num" }, a.decode_tok_s ? fmt(a.decode_tok_s, 2) : "–")));
+  box.replaceChildren(summary, el("div", { class: "table-wrap" }, el("table", {}, head, ...rows)));
 }
 
 function renderNodes(nodes) {

@@ -177,7 +177,8 @@ def cmd_serve(args) -> None:
     from .server import serve_http
     from .tokenizer import Tokenizer
     model = build_model(args)
-    serve_http(model, Tokenizer(args.model), Path(args.model).name, args.host, args.port)
+    serve_http(model, Tokenizer(args.model), Path(args.model).name, args.host, args.port,
+               max_batch=args.max_batch)
     model.backend.close()
 
 
@@ -259,6 +260,8 @@ def main(argv=None) -> None:
     _add_cluster_args(p)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
+    p.add_argument("--max-batch", type=int, default=4,
+                   help="requests decoded together (1 = one at a time)")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("monitor", help="dashboard of worker health, without loading a model")

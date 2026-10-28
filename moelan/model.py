@@ -361,7 +361,7 @@ class MoEModel:
     def new_cache(self) -> KVCache:
         return KVCache(self.cfg)
 
-    def _mla(self, L, h, positions, cache: KVCache, layer: int) -> np.ndarray:
+    def _mla(self, L, h, positions, segs, layer: int) -> np.ndarray:
         """DeepSeek multi-head latent attention with the latent KV cache.
 
         Keys/values are never expanded: with W_kv_b = [W_uk; W_uv] per head,
@@ -380,19 +380,25 @@ class MoEModel:
         ckv = _mm(h, L["kv_a"])
         c = rms_norm(ckv[:, :cfg.kv_lora_rank], L["kv_a_norm"], eps)
         k_pe = self.rotary(ckv[:, None, cfg.kv_lora_rank:], positions)[:, 0]
-        C, KPE = cache.append(layer, c[None], k_pe[None], int(positions[0]))
-        C, KPE = C[0], KPE[0]                                            # (T, r), (T, rd)
-        q_lat = np.matmul(q_nope.transpose(1, 0, 2), L["w_uk"])         # (H, n, r)
-        scores = (q_lat @ C.T + q_pe.transpose(1, 0, 2) @ KPE.T) * self.softmax_scale
-        mask = np.arange(C.shape[0])[None, :] > positions[:, None]
-        probs = softmax(np.where(mask[None], -np.inf, scores), axis=-1)  # (H, n, T)
-        out = np.matmul(probs @ C, L["w_uv_t"])                          # (H, n, v)
-        return _mm(out.transpose(1, 0, 2).reshape(n, H * cfg.v_head_dim), L["o"])
+        out = np.empty((n, H, cfg.v_head_dim), np.float32)
+        for a, b, cache in segs:                                          # each sequence's own cache
+            pos = positions[a:b]
+            C, KPE = cache.append(layer, c[None, a:b], k_pe[None, a:b], int(pos[0]))
+            C, KPE = C[0], KPE[0]                                        # (T, r), (T, rd)
+            q_lat = np.matmul(q_nope[a:b].transpose(1, 0, 2), L["w_uk"])  # (H, m, r)
+            scores = (q_lat @ C.T + q_pe[a:b].transpose(1, 0, 2) @ KPE.T) * self.softmax_scale
+            mask = np.arange(C.shape[0])[None, :] > pos[:, None]
+            probs = softmax(np.where(mask[None], -np.inf, scores), axis=-1)  # (H, m, T)
+            out[a:b] = np.matmul(probs @ C, L["w_uv_t"]).transpose(1, 0, 2)  # (m, H, v)
+        return _mm(out.reshape(n, H * cfg.v_head_dim), L["o"])
 
-    def _attention(self, L, h, positions, cache: KVCache, layer: int) -> np.ndarray:
+    def _attention(self, L, h, positions, segs, layer: int) -> np.ndarray:
+        """Attention for the rows of ``h``. ``segs`` lists (start, end, cache):
+        the rows of each sequence and its KV cache. Projections run once for
+        all rows; only the score/value step is per sequence."""
         cfg = self.cfg
         if cfg.attention == "mla":
-            return self._mla(L, h, positions, cache, layer)
+            return self._mla(L, h, positions, segs, layer)
         n = h.shape[0]
         H, KV, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
         q, k, v = _mm(h, L["q"]), _mm(h, L["k"]), _mm(h, L["v"])
@@ -410,18 +416,19 @@ class MoEModel:
             k = rms_norm(k, kn, cfg.rms_norm_eps)
         q = self.rotary(q, positions)
         k = self.rotary(k, positions)
-        K, V = cache.append(layer, k.transpose(1, 0, 2), v.transpose(1, 0, 2), int(positions[0]))
-        T = K.shape[1]
         g = H // KV
-        qg = q.transpose(1, 0, 2).reshape(KV, g, n, hd)
-        scores = np.einsum("kgnd,ktd->kgnt", qg, K) * (1.0 / math.sqrt(hd))  # python float: stays f32
-        key_pos = np.arange(T)
-        mask = key_pos[None, :] > positions[:, None]          # (n, T) causal
-        scores = np.where(mask[None, None], -np.inf, scores)
-        probs = softmax(scores, axis=-1)
-        out = np.einsum("kgnt,ktd->kgnd", probs, V)           # (KV, g, n, hd)
-        out = out.reshape(H, n, hd).transpose(1, 0, 2).reshape(n, H * hd)
-        return _mm(out, L["o"])
+        out = np.empty((n, H, hd), np.float32)
+        for a, b, cache in segs:
+            m, pos = b - a, positions[a:b]
+            K, V = cache.append(layer, k[a:b].transpose(1, 0, 2), v[a:b].transpose(1, 0, 2), int(pos[0]))
+            qg = q[a:b].transpose(1, 0, 2).reshape(KV, g, m, hd)
+            scores = np.einsum("kgnd,ktd->kgnt", qg, K) * (1.0 / math.sqrt(hd))  # python float: stays f32
+            mask = np.arange(K.shape[1])[None, :] > pos[:, None]          # (m, T) causal
+            scores = np.where(mask[None, None], -np.inf, scores)
+            probs = softmax(scores, axis=-1)
+            o = np.einsum("kgnt,ktd->kgnd", probs, V)                     # (KV, g, m, hd)
+            out[a:b] = o.reshape(H, m, hd).transpose(1, 0, 2)
+        return _mm(out.reshape(n, H * hd), L["o"])
 
     def _ffn(self, L, h, layer: int) -> np.ndarray:
         cfg = self.cfg
@@ -442,18 +449,36 @@ class MoEModel:
 
     def forward(self, tokens, cache: KVCache) -> np.ndarray:
         """Run ``tokens`` (appended after the cache) and return last-position logits."""
+        return self.forward_batch([tokens], [cache])[0]
+
+    def forward_batch(self, token_lists, caches) -> np.ndarray:
+        """Advance several sequences at once, each by its own tokens and with its
+        own KV cache; returns the last-position logits of each, (B, vocab).
+
+        All rows go through every weight matrix together and each MoE layer is
+        one backend call, so in a cluster every worker gets one request per
+        layer for the whole batch, and an expert several sequences picked
+        decodes its weights once for all of them."""
         cfg = self.cfg
-        tokens = np.asarray(tokens, dtype=np.int64)
-        positions = np.arange(cache.length, cache.length + len(tokens))
+        segs, positions, start = [], [], 0
+        for toks, cache in zip(token_lists, caches):
+            m = len(toks)
+            segs.append((start, start + m, cache))
+            positions.append(np.arange(cache.length, cache.length + m))
+            start += m
+        positions = np.concatenate(positions)
+        tokens = np.concatenate([np.asarray(t, dtype=np.int64) for t in token_lists])
         x = self.embed[tokens].astype(np.float32)
         for i, L in enumerate(self.layers):
             h = rms_norm(x, L["in_norm"], cfg.rms_norm_eps)
-            x = x + self._attention(L, h, positions, cache, i)
+            x = x + self._attention(L, h, positions, segs, i)
             h = rms_norm(x, L["post_norm"], cfg.rms_norm_eps)
             x = x + self._ffn(L, h, i)
-        cache.length += len(tokens)
-        x = rms_norm(x[-1:], self.norm, cfg.rms_norm_eps)
-        return _mm(x, self.lm_head)[0]
+        for a, b, cache in segs:
+            cache.length += b - a
+        last = np.array([b - 1 for _, b, _ in segs])
+        x = rms_norm(x[last], self.norm, cfg.rms_norm_eps)
+        return _mm(x, self.lm_head)
 
     def generate(self, prompt_ids, max_new_tokens: int = 64, temperature: float = 0.0,
                  top_p: float = 1.0, top_k: int = 0, seed: int | None = None,

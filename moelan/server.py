@@ -1,7 +1,8 @@
 """HTTP side: an OpenAI-compatible API (``/v1/chat/completions``,
 ``/v1/completions``, ``/v1/models``) and the monitoring dashboard (``/``) with
 its JSON feeds (``/api/status``, ``/api/heat``; ``/cluster`` is kept).
-One generation at a time; requests queue on a lock, monitoring never waits.
+Concurrent requests are decoded together by a :class:`~moelan.batching.Batcher`;
+monitoring never waits on generation.
 
 ``moelan monitor`` serves the same dashboard without a model: it polls the
 workers directly and shows their health.
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 
 from . import kernels
+from .batching import Batcher, GenRequest
 from .model import MoEModel
 from .tokenizer import Tokenizer
 
@@ -38,30 +40,37 @@ class Telemetry:
         self.requests = 0
         self.tokens_in = 0
         self.tokens_out = 0
-        self.active: dict | None = None
+        self.active: dict[str, dict] = {}
         self.recent: deque = deque(maxlen=20)
-        self.token_times: deque = deque(maxlen=4096)
+        self.token_times: deque = deque(maxlen=8192)
 
     def begin(self, rid: str, prompt_tokens: int) -> None:
         with self.lock:
             self.requests += 1
             self.tokens_in += prompt_tokens
-            self.active = {"id": rid, "prompt_tokens": prompt_tokens, "generated": 0,
-                           "started": time.time(), "first_token": None}
+            self.active[rid] = {"id": rid, "prompt_tokens": prompt_tokens, "generated": 0,
+                                "started": time.time(), "admitted": None, "first_token": None}
 
-    def token(self) -> None:
+    def admit(self, rid: str) -> None:
+        with self.lock:
+            a = self.active.get(rid)
+            if a is not None:
+                a["admitted"] = time.time()
+
+    def token(self, rid: str) -> None:
         now = time.time()
         with self.lock:
             self.tokens_out += 1
             self.token_times.append(now)
-            if self.active is not None:
-                self.active["generated"] += 1
-                if self.active["first_token"] is None:
-                    self.active["first_token"] = now
+            a = self.active.get(rid)
+            if a is not None:
+                a["generated"] += 1
+                if a["first_token"] is None:
+                    a["first_token"] = now
 
-    def end(self) -> None:
+    def end(self, rid: str) -> None:
         with self.lock:
-            a, self.active = self.active, None
+            a = self.active.pop(rid, None)
         if a is None:
             return
         now = time.time()
@@ -69,7 +78,9 @@ class Telemetry:
         decode_n = max(a["generated"] - 1, 0)
         self.recent.appendleft({
             "id": a["id"], "prompt_tokens": a["prompt_tokens"], "completion_tokens": a["generated"],
-            "prefill_s": round(first - a["started"], 3), "total_s": round(now - a["started"], 3),
+            "wait_s": round((a["admitted"] or first) - a["started"], 3),
+            "prefill_s": round(first - (a["admitted"] or a["started"]), 3),
+            "total_s": round(now - a["started"], 3),
             "decode_tok_s": round(decode_n / (now - first), 3) if decode_n and now > first else None,
             "ended": now})
 
@@ -77,18 +88,18 @@ class Telemetry:
         now = time.time()
         with self.lock:
             recent_tokens = sum(1 for t in self.token_times if now - t <= RATE_WINDOW_S)
-            active = dict(self.active) if self.active else None
+            active = [dict(a) for a in self.active.values()]
             out = {"uptime_s": now - self.started, "requests": self.requests,
                    "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
-                   "rate_tok_s": recent_tokens / RATE_WINDOW_S, "busy": active is not None,
-                   "recent": list(self.recent)}
-        if active:
-            ft = active["first_token"]
-            active["elapsed_s"] = now - active["started"]
-            active["phase"] = "decode" if ft else "prefill"
-            n = active["generated"] - 1
-            active["decode_tok_s"] = n / (now - ft) if ft and n > 0 and now > ft else None
-            out["active"] = active
+                   "rate_tok_s": recent_tokens / RATE_WINDOW_S, "busy": bool(active),
+                   "running": len(active), "recent": list(self.recent)}
+        for a in active:
+            ft = a["first_token"]
+            a["elapsed_s"] = now - a["started"]
+            a["phase"] = "decode" if ft else ("prefill" if a["admitted"] else "waiting")
+            n = a["generated"] - 1
+            a["decode_tok_s"] = n / (now - ft) if ft and n > 0 and now > ft else None
+        out["active"] = sorted(active, key=lambda a: a["started"])
         return out
 
 
@@ -140,7 +151,7 @@ class _Handler(BaseHTTPRequestHandler):
     model: MoEModel | None
     tok: Tokenizer | None
     name: str
-    lock: threading.Lock
+    batcher: Batcher | None
     tel: Telemetry
     monitor = None  # WorkerMonitor in monitor-only mode
     protocol_version = "HTTP/1.1"
@@ -186,7 +197,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "gen": self.tel.snapshot(), "moe_time_s": 0.0}
         return {"mode": "serve", "model": model_info(self.model, self.name),
                 "nodes": node_stats(self.model), "gen": self.tel.snapshot(),
-                "moe_time_s": self.model.backend.moe_time}
+                "batch": self.batcher.stats(), "moe_time_s": self.model.backend.moe_time}
 
     def do_POST(self):
         if self.model is None:
@@ -207,45 +218,63 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             return self._json(404, {"error": "not found"})
         ids = self.tok.encode(prompt)
-        kw = dict(max_new_tokens=int(req.get("max_tokens", 256)),
-                  temperature=float(req.get("temperature", 0.0)),
-                  top_p=float(req.get("top_p", 1.0)), top_k=int(req.get("top_k", 0)),
-                  seed=req.get("seed"))
+        if not ids:
+            return self._json(400, {"error": "empty prompt"})
         rid = f"moelan-{uuid.uuid4().hex[:12]}"
-        with self.lock:
-            self.tel.begin(rid, len(ids))
-            try:
-                if req.get("stream"):
-                    return self._stream(rid, ids, kw, chat)
-                out = []
-                t0 = time.perf_counter()
-                for t in self.model.generate(ids, **kw):
-                    self.tel.token()
-                    out.append(t)
-                text = self.tok.decode([t for t in out if t not in self.model.cfg.eos_token_ids])
-                usage = {"prompt_tokens": len(ids), "completion_tokens": len(out),
-                         "total_tokens": len(ids) + len(out),
-                         "tokens_per_second": len(out) / max(time.perf_counter() - t0, 1e-9)}
-            finally:
-                self.tel.end()
+        try:
+            gen = GenRequest(rid, ids, max_new_tokens=int(req.get("max_tokens", 256)),
+                             temperature=float(req.get("temperature", 0.0)),
+                             top_p=float(req.get("top_p", 1.0)), top_k=int(req.get("top_k", 0)),
+                             seed=req.get("seed"), stop_ids=self.model.cfg.eos_token_ids)
+        except (TypeError, ValueError) as exc:
+            return self._json(400, {"error": str(exc)})
+        self.tel.begin(rid, len(ids))
+        self.batcher.submit(gen)
+        if req.get("stream"):
+            return self._stream(rid, gen, chat)
+        out = []
+        t0 = time.perf_counter()
+        try:
+            for t in gen.tokens():
+                out.append(t)
+        except Exception as exc:
+            return self._json(500, {"error": f"generation failed: {exc}"})
+        text = self.tok.decode([t for t in out if t not in self.model.cfg.eos_token_ids])
+        usage = {"prompt_tokens": len(ids), "completion_tokens": len(out),
+                 "total_tokens": len(ids) + len(out),
+                 "tokens_per_second": len(out) / max(time.perf_counter() - t0, 1e-9)}
         choice = ({"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
                   if chat else {"index": 0, "text": text, "finish_reason": "stop"})
         self._json(200, {"id": rid, "object": "chat.completion" if chat else "text_completion",
                          "created": int(time.time()), "model": self.name,
                          "choices": [choice], "usage": usage})
 
-    def _stream(self, rid, ids, kw, chat):
+    def _stream(self, rid, gen: GenRequest, chat):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-        out, sent = [], ""
         eos = set(self.model.cfg.eos_token_ids)
-        for t in self.model.generate(ids, **kw):
-            self.tel.token()
+        try:
+            self._relay(rid, gen, chat, eos)
+        except (BrokenPipeError, ConnectionError):
+            gen.cancelled = True  # client went away: the scheduler drops the request
+            return
+        except Exception as exc:
+            self._event({"id": rid, "error": f"generation failed: {exc}"})
+        end = ({"index": 0, "delta": {}, "finish_reason": "stop"} if chat
+               else {"index": 0, "text": "", "finish_reason": "stop"})
+        self._event({"id": rid, "model": self.name, "choices": [end]})
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.close_connection = True
+
+    def _relay(self, rid, gen: GenRequest, chat, eos) -> None:
+        """Forward the scheduler's tokens to the client as text deltas."""
+        out, sent = [], ""
+        for t in gen.tokens():
             if t in eos:
-                break
+                continue  # the scheduler ends the request right after
             out.append(t)
             text = self.tok.decode(out)
             if text.endswith("�"):
@@ -254,11 +283,6 @@ class _Handler(BaseHTTPRequestHandler):
             chunk = ({"index": 0, "delta": {"content": delta}} if chat else {"index": 0, "text": delta})
             self._event({"id": rid, "object": "chat.completion.chunk" if chat else "text_completion",
                          "model": self.name, "choices": [chunk]})
-        end = ({"index": 0, "delta": {}, "finish_reason": "stop"} if chat
-               else {"index": 0, "text": "", "finish_reason": "stop"})
-        self._event({"id": rid, "model": self.name, "choices": [end]})
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.close_connection = True
 
     def _event(self, obj) -> None:
         self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
@@ -319,15 +343,21 @@ class WorkerMonitor(threading.Thread):
 
 
 def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
-                host: str = "127.0.0.1", port: int = 8000, monitor: WorkerMonitor | None = None):
+                host: str = "127.0.0.1", port: int = 8000, monitor: WorkerMonitor | None = None,
+                max_batch: int = 4):
+    tel = Telemetry()
+    batcher = None
+    if model is not None:
+        batcher = Batcher(model, tel, max_batch=max_batch)
+        batcher.start()
     handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name,
-                                      "lock": threading.Lock(), "tel": Telemetry(), "monitor": monitor})
+                                      "batcher": batcher, "tel": tel, "monitor": monitor})
     return ThreadingHTTPServer((host, port), handler)
 
 
 def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: str = "127.0.0.1",
-               port: int = 8000, monitor: WorkerMonitor | None = None):
-    httpd = make_server(model, tok, name, host, port, monitor)
+               port: int = 8000, monitor: WorkerMonitor | None = None, max_batch: int = 4):
+    httpd = make_server(model, tok, name, host, port, monitor, max_batch=max_batch)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     print(f"dashboard:  http://{shown}:{port}/")
     if model is not None:
