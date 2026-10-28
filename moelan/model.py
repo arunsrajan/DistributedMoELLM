@@ -264,6 +264,10 @@ def load_heat(path: str | Path) -> Counter:
 # KV cache and the model
 # ---------------------------------------------------------------------------
 
+class Interrupted(Exception):
+    """A forward pass stopped on request (its clients went away)."""
+
+
 class KVCache:
     def __init__(self, cfg: ModelConfig, capacity: int = 256):
         self.cfg = cfg
@@ -513,7 +517,7 @@ class MoEModel:
 
     PREFILL_CHUNK = 8192   # rows per pass when reading long prompts (attention is blocked anyway)
 
-    def forward_batch(self, token_lists, caches, on_progress=None) -> np.ndarray:
+    def forward_batch(self, token_lists, caches, on_progress=None, should_stop=None) -> np.ndarray:
         """Advance several sequences at once, each by its own tokens and with its
         own KV cache; returns the last-position logits of each, (B, vocab).
 
@@ -524,9 +528,12 @@ class MoEModel:
 
         Long inputs (agent prompts run to 10k+ tokens) are read in passes of at
         most ``PREFILL_CHUNK`` rows, so activations and attention scores stay
-        small; ``on_progress(done)`` gets each sequence's tokens read so far."""
+        small; ``on_progress(done)`` gets each sequence's tokens read so far,
+        after every layer (partly read passes count in proportion), and
+        ``should_stop()``, also checked after every layer, aborts the call with
+        :class:`Interrupted`; the caches then hold every completed pass."""
         token_lists = [list(t) for t in token_lists]
-        if sum(len(t) for t in token_lists) <= self.PREFILL_CHUNK:
+        if sum(len(t) for t in token_lists) <= self.PREFILL_CHUNK and not (on_progress or should_stop):
             return self._forward_pass(token_lists, caches)
         for toks, cache in zip(token_lists, caches):
             cache.reserve(cache.length + len(toks))      # one allocation, not one per pass
@@ -536,16 +543,23 @@ class MoEModel:
             live = [i for i, t in enumerate(token_lists) if done[i] < len(t)]
             per = max(1, self.PREFILL_CHUNK // len(live))
             chunks = [token_lists[i][done[i]:done[i] + per] for i in live]
-            out = self._forward_pass(chunks, [caches[i] for i in live])
+
+            def after_layer(frac, live=live, chunks=chunks):
+                if on_progress:
+                    part = list(done)
+                    for i, c in zip(live, chunks):
+                        part[i] += int(len(c) * frac)
+                    on_progress(part)
+                if should_stop and should_stop():
+                    raise Interrupted()
+            out = self._forward_pass(chunks, [caches[i] for i in live], after_layer)
             for i, c, lg in zip(live, chunks, out):
                 done[i] += len(c)
                 if done[i] == len(token_lists[i]):
                     logits[i] = lg
-            if on_progress:
-                on_progress(list(done))
         return np.stack(logits)
 
-    def _forward_pass(self, token_lists, caches) -> np.ndarray:
+    def _forward_pass(self, token_lists, caches, after_layer=None) -> np.ndarray:
         cfg = self.cfg
         segs, positions, start = [], [], 0
         for toks, cache in zip(token_lists, caches):
@@ -561,6 +575,8 @@ class MoEModel:
             x = x + self._attention(L, h, positions, segs, i)
             h = rms_norm(x, L["post_norm"], cfg.rms_norm_eps)
             x = x + self._ffn(L, h, i)
+            if after_layer:
+                after_layer((i + 1) / len(self.layers))
         for a, b, cache in segs:
             cache.length += b - a
         last = np.array([b - 1 for _, b, _ in segs])

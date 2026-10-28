@@ -869,21 +869,30 @@ def test_chunked_prefill_matches_one_pass(tiny, monkeypatch):
     c = m.new_cache()
     chunked = m.forward_batch([toks], [c], on_progress=seen.append)[0]
     np.testing.assert_allclose(chunked, one, atol=1e-4, rtol=1e-4)
-    assert [d[0] for d in seen] == list(range(37, 300, 37)) + [300] and c.length == 300
+    reads = [d[0] for d in seen]                           # reported after every layer
+    assert reads == sorted(reads) and reads[-1] == 300 and c.length == 300
+    assert {37, 74} <= set(reads)                          # whole passes show up exactly
 
 
 def test_abandoned_prefill_is_kept_for_the_retry(tiny, monkeypatch):
     monkeypatch.setattr(MoEModel, "PREFILL_CHUNK", 16)
     m = MoEModel(tiny)
     toks = [256] + list(np.random.default_rng(4).integers(0, 256, 99))
-    b = Batcher(m, max_batch=1)
     first = GenRequest("a", toks, max_new_tokens=4)
-    first.cancelled = True          # client gone: the prefill stops after its first chunk
+
+    class Tel:   # the client goes away once two passes (32 tokens) are read
+        def admit(self, *a, **k): pass
+        def token(self, *a): pass
+        def end(self, *a): pass
+        def progress(self, rid, read):
+            if read >= 32:
+                first.cancelled = True
+    b = Batcher(m, Tel(), max_batch=1)
     b._prefill([first])
-    assert first.done
+    assert first.done and first.cache is None          # stopped within a layer, not after the prompt
     retry = GenRequest("b", toks, max_new_tokens=4)
     b._prefill([retry])
-    assert retry.cached >= 16       # resumed from the abandoned request's work
+    assert 16 <= retry.cached < len(toks)              # resumed from the passes completed before the stop
     b._finish(retry)
 
 
@@ -903,3 +912,73 @@ def test_prompt_cache_survives_restart_on_disk(tiny, tmp_path):
     assert hit == len(toks) and fresh.disk_hits == 1
     want = m.forward(longer, m.new_cache())
     np.testing.assert_allclose(m.forward(longer[hit:], cache), want, atol=1e-5)
+
+
+# --- robustness against clients that hang up ------------------------------------
+
+import struct as _struct
+
+
+def _rst(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, _struct.pack("ii", 1, 0))  # close = RST
+    sock.close()
+
+
+def _post(path, body):
+    data = _json.dumps(body).encode()
+    return (f"POST {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {len(data)}\r\n\r\n").encode() + data
+
+
+def test_server_survives_resets_and_cancels_abandoned_work(tiny):
+    from moelan.tokenizer import Tokenizer
+    server = make_server(MoEModel(tiny), Tokenizer(tiny), "tiny", port=0)
+    _serve(server)
+    port = server.server_address[1]
+    try:
+        acts = [lambda s: None,
+                lambda s: s.sendall(b"POST /v1/comp"),
+                lambda s: s.sendall(_post("/v1/completions", {"prompt": "x"})[:60]),
+                lambda s: (s.sendall(_post("/v1/completions", {"prompt": "hi", "max_tokens": 50, "stream": True})),
+                           s.recv(100)),
+                lambda s: (s.sendall(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n"), s.recv(4096))]
+        for act in acts:
+            s = socket.create_connection(("127.0.0.1", port))
+            act(s)
+            _rst(s)
+            assert _http(server, "/health")[0] == 200              # still serving
+        # a non-streamed request whose client hangs up is cancelled, not run to the end
+        s = socket.create_connection(("127.0.0.1", port))
+        s.sendall(_post("/v1/completions", {"prompt": "go on", "max_tokens": 100000}))
+        _time.sleep(0.3)
+        _rst(s)
+        deadline = _time.time() + 15
+        while _time.time() < deadline and _json.loads(_http(server, "/api/status")[2])["gen"]["busy"]:
+            _time.sleep(0.2)
+        status = _json.loads(_http(server, "/api/status")[2])
+        assert not status["gen"]["busy"]
+        assert status["gen"]["recent"][0]["completion_tokens"] < 100000
+        assert _http(server, "/v1/completions", {"prompt": "after", "max_tokens": 3})[0] == 200
+    finally:
+        server.shutdown()
+
+
+def test_scheduler_survives_a_failing_step(tiny, monkeypatch):
+    from moelan.tokenizer import Tokenizer
+    m = MoEModel(tiny)
+    server = make_server(m, Tokenizer(tiny), "tiny", port=0)
+    _serve(server)
+    real = m.forward_batch
+    calls = {"n": 0}
+
+    def flaky(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise MemoryError("simulated")
+        return real(*a, **k)
+    monkeypatch.setattr(m, "forward_batch", flaky)
+    try:
+        assert _http(server, "/v1/completions", {"prompt": "a", "max_tokens": 3})[0] == 500
+        assert _http(server, "/v1/completions", {"prompt": "b", "max_tokens": 3})[0] == 200
+    finally:
+        server.shutdown()

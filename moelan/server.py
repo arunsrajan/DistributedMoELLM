@@ -10,7 +10,11 @@ workers directly and shows their health.
 
 from __future__ import annotations
 
+import errno
 import json
+import logging
+import select
+import socket
 import threading
 import time
 import uuid
@@ -25,6 +29,33 @@ from .tokenizer import Tokenizer
 from .tools import parse_tool_calls, safe_prefix_len
 
 MAX_BODY = 4 * 1024 * 1024
+DISCONNECTS = (ConnectionError, TimeoutError)   # resets, aborts, broken pipes (all OSError)
+log = logging.getLogger("moelan.server")
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys
+        exc = sys.exc_info()[1]
+        if isinstance(exc, DISCONNECTS) or (isinstance(exc, OSError) and exc.errno in (
+                errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE)):
+            log.info("client %s:%s disconnected (%s)", *client_address[:2], type(exc).__name__)
+            return                          # a client hanging up is not a server error
+        super().handle_error(request, client_address)
+
+
+def client_gone(sock: socket.socket) -> bool:
+    """True when the peer has closed or reset the connection (checked without
+    blocking or consuming data: a readable socket with nothing to read is closed)."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if not readable:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
 RATE_WINDOW_S = 3.0
 
 
@@ -252,8 +283,12 @@ class _Handler(BaseHTTPRequestHandler):
         out = []
         t0 = time.perf_counter()
         try:
-            for t in gen.tokens():
+            for t in gen.tokens(idle=self._check_client, every=2.0):
                 out.append(t)
+        except DISCONNECTS:
+            gen.cancelled = True        # nobody is waiting for it: the scheduler drops it
+            self.close_connection = True
+            return
         except Exception as exc:
             return self._json(500, {"error": f"generation failed: {exc}"})
         eos = set(self.model.cfg.eos_token_ids)
@@ -286,8 +321,9 @@ class _Handler(BaseHTTPRequestHandler):
         finish = "stop"
         try:
             finish = self._relay(rid, gen, chat, eos, tools)
-        except (BrokenPipeError, ConnectionError):
+        except DISCONNECTS:
             gen.cancelled = True  # client went away: the scheduler drops the request
+            self.close_connection = True
             return
         except Exception as exc:
             self._event({"id": rid, "error": f"generation failed: {exc}"})
@@ -313,10 +349,11 @@ class _Handler(BaseHTTPRequestHandler):
         last = None
 
         def keepalive():   # SSE comment: clients ignore it, but the connection stays alive
+            self._check_client()
             self.wfile.write(b": reading prompt\n\n")
             self.wfile.flush()
 
-        for t in gen.tokens(idle=keepalive):
+        for t in gen.tokens(idle=keepalive, every=5.0):
             last = t
             if t in eos:
                 continue  # the scheduler ends the request right after
@@ -338,6 +375,12 @@ class _Handler(BaseHTTPRequestHandler):
             if len(text) > len(sent):   # a tool-call start that never became a call
                 send({"content": text[len(sent):]})
         return finish
+
+    def _check_client(self) -> None:
+        """While a request waits for tokens: if its client hung up, raise, so
+        the handler cancels the request instead of computing for nobody."""
+        if client_gone(self.connection):
+            raise ConnectionResetError("client closed the connection")
 
     def _event(self, obj) -> None:
         self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
@@ -409,7 +452,7 @@ def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
         batcher.start()
     handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name,
                                       "batcher": batcher, "tel": tel, "monitor": monitor})
-    return ThreadingHTTPServer((host, port), handler)
+    return _Server((host, port), handler)
 
 
 def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: str = "127.0.0.1",

@@ -279,9 +279,16 @@ specially:
   which used to push the machine into swapping and looked like a hang).
   Prompts longer than 8192 tokens are read in passes of that size.
 * **Keep-alives.** While a prompt is read, streaming responses send an SSE
-  comment every 10 s, so clients do not time out, and the dashboard shows how
-  far the prompt has been read. If the client disconnects, the read stops and
-  the part already read is kept for its retry.
+  comment every 5 s, so clients do not time out, and the dashboard shows how
+  far the prompt has been read, layer by layer.
+* **Clients that hang up.** The server checks every few seconds whether a
+  waiting client is still connected (streamed or not). If not, the request is
+  cancelled within one layer (about 10 s at most) instead of being computed to
+  the end while new requests queue behind it, and every fully read pass of its
+  prompt is kept for a retry. Resets and aborted connections are logged as one
+  line, never stop the server, and the scheduler thread survives any failed
+  step. Measured: a 3.2k-token prompt abandoned 20 s in, and a new request was
+  answered 8.9 s later (before: after the whole abandoned prompt, ~2 min).
 * **Prompt cache in memory and on disk** (`--prompt-cache-tokens 16384`,
   `--prompt-cache-disk 8G`, `--prompt-cache-dir`). The next turn reuses the
   conversation so far; long prompts are also written to disk (0.2 MB per token

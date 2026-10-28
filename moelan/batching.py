@@ -24,17 +24,14 @@ import os
 import queue
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
 
-from .model import MoEModel, sample
+from .model import Interrupted, MoEModel, sample
 
 log = logging.getLogger("moelan.batching")
-
-
-class _Abandoned(Exception):
-    """Every request in a prefill pass was cancelled by its client."""
 
 
 class GenRequest:
@@ -250,29 +247,45 @@ class Batcher(threading.Thread):
 
     # ---- scheduler loop ---------------------------------------------------
     def run(self) -> None:
+        # The scheduler must outlive any single failure: if this thread died the
+        # server would keep accepting connections and never answer them.
         while True:
-            new = []
-            if not self.running:
-                new.append(self.pending.get())        # idle: wait for work
-            while len(self.running) + len(new) < self.max_batch:
-                try:
-                    new.append(self.pending.get_nowait())
-                except queue.Empty:
-                    break
-            new = [r for r in new if not r.cancelled]
             try:
-                if new:
-                    self._prefill(new)
-                self.running = [r for r in self.running + new if not r.done]
-                if self.running:
-                    self._decode(self.running)
-                self.running = [r for r in self.running if not r.done]
-            except Exception as exc:  # fail the affected requests, keep serving
-                log.exception("batched step failed")
-                for r in self.running + new:
+                self._step()
+            except BaseException:   # noqa: BLE001 - log, drop the batch, keep scheduling
+                log.exception("scheduler step failed; continuing")
+                for r in self.running:
                     if not r.done:
-                        self._finish(r, exc)
+                        self._finish(r, RuntimeError("internal error in the scheduler"))
                 self.running = []
+                time.sleep(0.1)
+
+    def _step(self) -> None:
+        new = []
+        if not self.running:
+            new.append(self.pending.get())        # idle: wait for work
+        while len(self.running) + len(new) < self.max_batch:
+            try:
+                new.append(self.pending.get_nowait())
+            except queue.Empty:
+                break
+        for r in new:
+            if r.cancelled:     # the client left while queued
+                self._finish(r)
+        new = [r for r in new if not r.done]
+        try:
+            if new:
+                self._prefill(new)
+            self.running = [r for r in self.running + new if not r.done]
+            if self.running:
+                self._decode(self.running)
+            self.running = [r for r in self.running if not r.done]
+        except Exception as exc:  # fail the affected requests, keep serving
+            log.exception("batched step failed")
+            for r in self.running + new:
+                if not r.done:
+                    self._finish(r, exc)
+            self.running = []
 
     def _prefill(self, reqs: list[GenRequest]) -> None:
         todo = []
@@ -284,22 +297,20 @@ class Batcher(threading.Thread):
             todo.append(r.ids[hit:])
             if self.tel:
                 self.tel.admit(r.rid, cached=hit)
-        read = [0] * len(reqs)
-
         def progress(done):
-            read[:] = done
             if self.tel:
                 for r, d in zip(reqs, done):
                     self.tel.progress(r.rid, r.cached + d)
-            if all(r.cancelled for r in reqs):
-                raise _Abandoned()
         try:
-            logits = self.model.forward_batch(todo, [r.cache for r in reqs], on_progress=progress)
-        except _Abandoned:
-            # Keep what was read: a client that retries resumes from here.
-            for r, d in zip(reqs, read):
-                if d and r.cache is not None:
-                    self.pcache.store(r.ids[:r.cached + d], r.cache)
+            logits = self.model.forward_batch(
+                todo, [r.cache for r in reqs], on_progress=progress,
+                should_stop=lambda: all(r.cancelled for r in reqs))   # checked after every layer
+        except Interrupted:
+            # Every client went away. Keep the passes already read: a client
+            # that retries resumes from there instead of starting over.
+            for r in reqs:
+                if r.cache is not None and r.cache.length > r.cached:
+                    self.pcache.store(r.ids[:r.cache.length], r.cache)
                 r.cache = None
                 self._finish(r)
             return
