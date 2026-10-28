@@ -18,15 +18,23 @@ matters for agents whose tool definitions run to hundreds of tokens.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 import queue
+import shutil
 import threading
+from pathlib import Path
 
 import numpy as np
 
 from .model import MoEModel, sample
 
 log = logging.getLogger("moelan.batching")
+
+
+class _Abandoned(Exception):
+    """Every request in a prefill pass was cancelled by its client."""
 
 
 class GenRequest:
@@ -52,10 +60,16 @@ class GenRequest:
         self.done = False
         self.cancelled = False   # set by the HTTP side when the client goes away
 
-    def tokens(self):
-        """Yield generated ids until the request finishes; re-raise model errors."""
+    def tokens(self, idle=None, every: float = 10.0):
+        """Yield generated ids until the request finishes; re-raise model errors.
+        ``idle()`` is called every ``every`` seconds without a token (a long
+        prompt being read), e.g. to keep a streaming connection alive."""
         while True:
-            item = self.out.get()
+            try:
+                item = self.out.get(timeout=every if idle else None)
+            except queue.Empty:
+                idle()
+                continue
             if item is None:
                 return
             if isinstance(item, BaseException):
@@ -65,16 +79,45 @@ class GenRequest:
 
 class PromptCache:
     """KV caches of finished conversations, keyed by the tokens they hold.
-    Least recently used entries go first once ``max_tokens`` is exceeded."""
 
-    def __init__(self, max_tokens: int = 4096, min_match: int = 8):
+    In memory, least recently used entries go first once ``max_tokens`` is
+    exceeded. With ``disk_dir``, long entries (``disk_min`` tokens and up, such
+    as a coding agent's system prompt) are also written to disk in the
+    background and found again after a restart, so a prompt that takes minutes
+    to read is read once, not once per server start. Disk use is capped at
+    ``disk_max_bytes``, oldest entries deleted first."""
+
+    def __init__(self, max_tokens: int = 16384, min_match: int = 8, disk_dir=None,
+                 disk_max_bytes: int = 0, new_cache=None, disk_min: int = 512):
         self.max_tokens = max_tokens
         self.min_match = min_match
         self.entries: list[tuple[np.ndarray, object]] = []   # most recently used last
         self.lock = threading.Lock()
         self.hits = 0
+        self.disk_hits = 0
         self.lookups = 0
         self.tokens_saved = 0
+        self.new_cache = new_cache
+        self.disk_min = disk_min
+        self.disk_max = disk_max_bytes
+        self.disk_dir = Path(disk_dir) if disk_dir and disk_max_bytes > 0 and new_cache else None
+        self.disk: list[tuple[np.ndarray, Path]] = []
+        self._writer = None
+        if self.disk_dir is not None:
+            self.disk_dir.mkdir(parents=True, exist_ok=True)
+            from concurrent.futures import ThreadPoolExecutor
+            self._writer = ThreadPoolExecutor(1, thread_name_prefix="moelan-kvdisk")
+            for d in sorted(self.disk_dir.iterdir(), key=lambda d: d.stat().st_mtime):
+                try:
+                    self.disk.append((np.load(d / "tokens.npy"), d))
+                except (OSError, ValueError):
+                    shutil.rmtree(d, ignore_errors=True)     # half-written entry
+
+    @staticmethod
+    def _common(a: np.ndarray, toks: np.ndarray, limit: int) -> int:
+        n = min(limit, len(toks))
+        diff = np.flatnonzero(a[:n] != toks[:n])
+        return int(diff[0]) if diff.size else n
 
     def lookup(self, ids):
         """(cache holding the longest cached prefix of ``ids``, its length) or
@@ -82,22 +125,30 @@ class PromptCache:
         a = np.asarray(ids, dtype=np.int64)
         with self.lock:
             self.lookups += 1
-            best, best_len = None, 0
+            best, best_len, where = None, 0, None
             for i, (toks, _) in enumerate(self.entries):
-                n = min(len(a) - 1, len(toks))
-                if n <= best_len:
-                    continue
-                diff = np.flatnonzero(a[:n] != toks[:n])
-                common = int(diff[0]) if diff.size else n
+                common = self._common(a, toks, len(a) - 1)
                 if common > best_len:
-                    best, best_len = i, common
+                    best, best_len, where = i, common, "mem"
+            for i, (toks, _) in enumerate(self.disk):
+                common = self._common(a, toks, len(a) - 1)
+                if common > best_len:
+                    best, best_len, where = i, common, "disk"
             if best is None or best_len < self.min_match:
                 return None, 0
-            entry = self.entries.pop(best)
-            self.entries.append(entry)
+            if where == "mem":
+                entry = self.entries.pop(best)
+                self.entries.append(entry)
+                cache = entry[1].clone(best_len)
+            else:
+                cache = self._load(self.disk[best][1], best_len)
+                if cache is None:
+                    return None, 0
+                os.utime(self.disk[best][1])            # most recently used
+                self.disk_hits += 1
             self.hits += 1
             self.tokens_saved += best_len
-            return entry[1].clone(best_len), best_len
+            return cache, best_len
 
     def store(self, tokens, cache) -> None:
         if self.max_tokens <= 0:
@@ -113,17 +164,70 @@ class PromptCache:
             self.entries.append((toks, compact))
             while sum(len(t) for t, _ in self.entries) > self.max_tokens:
                 self.entries.pop(0)
+        if self._writer is not None and len(toks) >= self.disk_min:
+            self._writer.submit(self._save, toks, compact)
+
+    # ---- disk -----------------------------------------------------------
+    def _save(self, toks: np.ndarray, cache) -> None:
+        try:
+            d = self.disk_dir / hashlib.sha1(toks.tobytes()).hexdigest()[:20]
+            if d.exists():
+                return
+            tmp = d.with_suffix(".part")
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp.mkdir()
+            n = len(toks)
+            for name, arrs in (("k", cache.k), ("v", cache.v)):
+                h, _, dim = arrs[0].shape
+                mm = np.lib.format.open_memmap(tmp / f"{name}.npy", mode="w+", dtype=np.float32,
+                                               shape=(len(arrs), h, n, dim))
+                for i, layer in enumerate(arrs):
+                    mm[i] = layer[:, :n]
+                mm.flush()
+                del mm
+            np.save(tmp / "tokens.npy", toks)           # written last: marks the entry complete
+            tmp.rename(d)
+            with self.lock:
+                # an entry that is a prefix of the new one is now redundant
+                for t, path in [e for e in self.disk if len(e[0]) <= n and np.array_equal(toks[:len(e[0])], e[0])]:
+                    shutil.rmtree(path, ignore_errors=True)
+                self.disk = [e for e in self.disk if e[1].exists()]
+                self.disk.append((toks, d))
+                while len(self.disk) > 1 and self._disk_bytes() > self.disk_max:
+                    shutil.rmtree(self.disk.pop(0)[1], ignore_errors=True)
+        except OSError:
+            log.exception("could not write the prompt cache to disk")
+
+    def _disk_bytes(self) -> int:
+        return sum(f.stat().st_size for _, d in self.disk for f in d.glob("*.npy") if f.exists())
+
+    def _load(self, d: Path, length: int):
+        try:
+            k = np.load(d / "k.npy", mmap_mode="r")
+            v = np.load(d / "v.npy", mmap_mode="r")
+        except (OSError, ValueError):
+            return None
+        c = self.new_cache()
+        c.reserve(length)
+        for i in range(len(c.k)):
+            c.k[i][:, :length] = k[i, :, :length]
+            c.v[i][:, :length] = v[i, :, :length]
+        c.length = length
+        return c
 
     def stats(self) -> dict:
         with self.lock:
             return {"entries": len(self.entries), "tokens": int(sum(len(t) for t, _ in self.entries)),
                     "max_tokens": self.max_tokens, "hits": self.hits, "lookups": self.lookups,
-                    "tokens_saved": self.tokens_saved}
+                    "tokens_saved": self.tokens_saved, "disk_entries": len(self.disk),
+                    "disk_hits": self.disk_hits,
+                    "disk_bytes": self._disk_bytes() if self.disk_dir else 0}
 
 
 class Batcher(threading.Thread):
     def __init__(self, model: MoEModel, telemetry=None, max_batch: int = 4,
-                 prompt_cache_tokens: int = 4096):
+                 prompt_cache_tokens: int = 16384, prompt_cache_dir=None,
+                 prompt_cache_disk: int = 0):
         super().__init__(daemon=True, name="moelan-batcher")
         self.model = model
         self.tel = telemetry
@@ -132,7 +236,13 @@ class Batcher(threading.Thread):
         self.running: list[GenRequest] = []
         self.steps = 0
         self.batch_sizes = 0  # sum over steps, for the average batch size
-        self.pcache = PromptCache(prompt_cache_tokens)
+        disk = None
+        if prompt_cache_disk > 0:
+            from .config import model_fingerprint
+            root = Path(prompt_cache_dir or Path.home() / ".moelan" / "kvcache")
+            disk = root / f"{model_fingerprint(model.model_dir)}-{model.dense_format}"
+        self.pcache = PromptCache(prompt_cache_tokens, disk_dir=disk, disk_max_bytes=prompt_cache_disk,
+                                  new_cache=model.new_cache)
 
     def submit(self, req: GenRequest) -> GenRequest:
         self.pending.put(req)
@@ -174,7 +284,25 @@ class Batcher(threading.Thread):
             todo.append(r.ids[hit:])
             if self.tel:
                 self.tel.admit(r.rid, cached=hit)
-        logits = self.model.forward_batch(todo, [r.cache for r in reqs])
+        read = [0] * len(reqs)
+
+        def progress(done):
+            read[:] = done
+            if self.tel:
+                for r, d in zip(reqs, done):
+                    self.tel.progress(r.rid, r.cached + d)
+            if all(r.cancelled for r in reqs):
+                raise _Abandoned()
+        try:
+            logits = self.model.forward_batch(todo, [r.cache for r in reqs], on_progress=progress)
+        except _Abandoned:
+            # Keep what was read: a client that retries resumes from here.
+            for r, d in zip(reqs, read):
+                if d and r.cache is not None:
+                    self.pcache.store(r.ids[:r.cached + d], r.cache)
+                r.cache = None
+                self._finish(r)
+            return
         for r, lg in zip(reqs, logits):
             self._emit(r, lg)
 

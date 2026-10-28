@@ -59,6 +59,12 @@ class Telemetry:
                 a["admitted"] = time.time()
                 a["cached_tokens"] = cached
 
+    def progress(self, rid: str, read: int) -> None:
+        with self.lock:
+            a = self.active.get(rid)
+            if a is not None:
+                a["prompt_read"] = read
+
     def token(self, rid: str) -> None:
         now = time.time()
         with self.lock:
@@ -305,7 +311,12 @@ class _Handler(BaseHTTPRequestHandler):
         if chat:
             send({"role": "assistant", "content": ""})
         last = None
-        for t in gen.tokens():
+
+        def keepalive():   # SSE comment: clients ignore it, but the connection stays alive
+            self.wfile.write(b": reading prompt\n\n")
+            self.wfile.flush()
+
+        for t in gen.tokens(idle=keepalive):
             last = t
             if t in eos:
                 continue  # the scheduler ends the request right after
@@ -388,11 +399,13 @@ class WorkerMonitor(threading.Thread):
 
 def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
                 host: str = "127.0.0.1", port: int = 8000, monitor: WorkerMonitor | None = None,
-                max_batch: int = 4, prompt_cache_tokens: int = 4096):
+                max_batch: int = 4, prompt_cache_tokens: int = 16384, prompt_cache_dir=None,
+                prompt_cache_disk: int = 0):
     tel = Telemetry()
     batcher = None
     if model is not None:
-        batcher = Batcher(model, tel, max_batch=max_batch, prompt_cache_tokens=prompt_cache_tokens)
+        batcher = Batcher(model, tel, max_batch=max_batch, prompt_cache_tokens=prompt_cache_tokens,
+                          prompt_cache_dir=prompt_cache_dir, prompt_cache_disk=prompt_cache_disk)
         batcher.start()
     handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name,
                                       "batcher": batcher, "tel": tel, "monitor": monitor})
@@ -401,9 +414,10 @@ def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
 
 def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: str = "127.0.0.1",
                port: int = 8000, monitor: WorkerMonitor | None = None, max_batch: int = 4,
-               prompt_cache_tokens: int = 4096):
+               prompt_cache_tokens: int = 16384, prompt_cache_dir=None, prompt_cache_disk: int = 0):
     httpd = make_server(model, tok, name, host, port, monitor, max_batch=max_batch,
-                        prompt_cache_tokens=prompt_cache_tokens)
+                        prompt_cache_tokens=prompt_cache_tokens, prompt_cache_dir=prompt_cache_dir,
+                        prompt_cache_disk=prompt_cache_disk)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     print(f"dashboard:  http://{shown}:{port}/")
     if model is not None:

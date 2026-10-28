@@ -195,9 +195,12 @@ def cmd_run(args) -> None:
 def cmd_serve(args) -> None:
     from .server import serve_http
     from .tokenizer import Tokenizer
+    from .worker import parse_size
     model = build_model(args)
     serve_http(model, Tokenizer(args.model), Path(args.model).name, args.host, args.port,
-               max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens)
+               max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens,
+               prompt_cache_dir=args.prompt_cache_dir,
+               prompt_cache_disk=parse_size(args.prompt_cache_disk, 0))
     model.backend.close()
 
 
@@ -282,8 +285,13 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--max-batch", type=int, default=4,
                    help="requests decoded together (1 = one at a time)")
-    p.add_argument("--prompt-cache-tokens", type=int, default=4096,
-                   help="tokens of recent conversations kept to reuse shared prompt starts (0 = off)")
+    p.add_argument("--prompt-cache-tokens", type=int, default=16384,
+                   help="tokens of recent conversations kept to reuse shared prompt starts "
+                        "(about 0.2 MB each for Qwen3-30B; 0 = off)")
+    p.add_argument("--prompt-cache-dir", default=None,
+                   help="where long prompt caches are kept across restarts (default ~/.moelan/kvcache)")
+    p.add_argument("--prompt-cache-disk", default="8G",
+                   help="disk space for them, e.g. 20G (0 = memory only)")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("monitor", help="dashboard of worker health, without loading a model")

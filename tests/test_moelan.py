@@ -852,3 +852,54 @@ def test_worker_hybrid_gpu(tiny, tmp_path):
         backend.close()
     finally:
         w.kill()
+
+
+# --- long prompts --------------------------------------------------------------------
+
+def test_chunked_prefill_matches_one_pass(tiny, monkeypatch):
+    m = MoEModel(tiny)
+    toks = [256] + list(np.random.default_rng(3).integers(0, 256, 299))
+    one = m.forward(toks, m.new_cache())                    # 300 rows: threaded attention blocks
+    c = m.new_cache()
+    for t in toks[:-1]:                                     # serial path, one token at a time
+        m.forward([t], c)
+    np.testing.assert_allclose(m.forward(toks[-1:], c), one, atol=1e-4, rtol=1e-4)
+    monkeypatch.setattr(MoEModel, "PREFILL_CHUNK", 37)
+    seen = []
+    c = m.new_cache()
+    chunked = m.forward_batch([toks], [c], on_progress=seen.append)[0]
+    np.testing.assert_allclose(chunked, one, atol=1e-4, rtol=1e-4)
+    assert [d[0] for d in seen] == list(range(37, 300, 37)) + [300] and c.length == 300
+
+
+def test_abandoned_prefill_is_kept_for_the_retry(tiny, monkeypatch):
+    monkeypatch.setattr(MoEModel, "PREFILL_CHUNK", 16)
+    m = MoEModel(tiny)
+    toks = [256] + list(np.random.default_rng(4).integers(0, 256, 99))
+    b = Batcher(m, max_batch=1)
+    first = GenRequest("a", toks, max_new_tokens=4)
+    first.cancelled = True          # client gone: the prefill stops after its first chunk
+    b._prefill([first])
+    assert first.done
+    retry = GenRequest("b", toks, max_new_tokens=4)
+    b._prefill([retry])
+    assert retry.cached >= 16       # resumed from the abandoned request's work
+    b._finish(retry)
+
+
+def test_prompt_cache_survives_restart_on_disk(tiny, tmp_path):
+    from moelan.batching import PromptCache
+    m = MoEModel(tiny)
+    toks = [256] + list(np.random.default_rng(5).integers(0, 256, 63))
+    c = m.new_cache()
+    m.forward(toks, c)
+    pc = PromptCache(4096, disk_dir=tmp_path, disk_max_bytes=2**30, new_cache=m.new_cache, disk_min=8)
+    pc.store(toks, c)
+    pc._writer.shutdown(wait=True)
+    fresh = PromptCache(4096, disk_dir=tmp_path, disk_max_bytes=2**30, new_cache=m.new_cache, disk_min=8)
+    assert len(fresh.disk) == 1 and not fresh.entries          # nothing in memory: a restart
+    longer = toks + [65, 66, 67]
+    cache, hit = fresh.lookup(longer)
+    assert hit == len(toks) and fresh.disk_hits == 1
+    want = m.forward(longer, m.new_cache())
+    np.testing.assert_allclose(m.forward(longer[hit:], cache), want, atol=1e-5)

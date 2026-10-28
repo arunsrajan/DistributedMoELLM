@@ -266,10 +266,41 @@ weather-tool exchange:
 | turn 1 | 327 | 0 | 30.1 s | `get_weather {"city": "Paris", "days": 2}` |
 | turn 2 (tool result) | 423 | 358 | 11.7 s | final answer from the tool's data |
 
-Reading long prompts also got about 1.9x faster (317 tokens: 43.8 s -> 23.5
-s): experts that get many prompt rows are widened once and multiplied with
-BLAS on parallel threads, long-prompt 16-bit matrices are split across
-threads, and attention uses batched matmul instead of `einsum`.
+### Coding agents (Cline, Continue, aider, ...)
+
+Agents send a long system prompt (Cline's is around 10k tokens) on every turn.
+On a CPU, reading a prompt costs far more than writing the answer, and
+attention grows with the square of its length, so moelan treats long prompts
+specially:
+
+* **Bounded memory.** Attention runs in blocks of 128 query rows per KV head
+  on all cores, each looking only at the keys up to its own position, instead
+  of building a heads x prompt x prompt score matrix (12.8 GB for a 10k prompt,
+  which used to push the machine into swapping and looked like a hang).
+  Prompts longer than 8192 tokens are read in passes of that size.
+* **Keep-alives.** While a prompt is read, streaming responses send an SSE
+  comment every 10 s, so clients do not time out, and the dashboard shows how
+  far the prompt has been read. If the client disconnects, the read stops and
+  the part already read is kept for its retry.
+* **Prompt cache in memory and on disk** (`--prompt-cache-tokens 16384`,
+  `--prompt-cache-disk 8G`, `--prompt-cache-dir`). The next turn reuses the
+  conversation so far; long prompts are also written to disk (0.2 MB per token
+  for Qwen3-30B) and found again after a restart.
+
+Measured on Qwen3-Coder-30B, a 3,200-token agent-style system prompt, streaming:
+
+| | read from cache | first token after |
+|---|---|---|
+| first request | 0 | 134.6 s (23.7 prompt tok/s), 13 keep-alives |
+| next turn | 3,195 tokens (memory) | 8.4 s |
+| after restarting the server | 3,226 tokens (disk) | 1.8 s |
+
+Prompt reading speed on this laptop: 2k tokens about 4.7 s per layer before
+these changes; an 8k prompt about 11.7 s per layer now (attention 6.9 s,
+experts 4.5 s), so a 10k-token first prompt takes roughly 10 minutes here.
+Beyond that the CPU's memory bandwidth limits attention (parallel BLAS and
+`exp` passes scale only 3x on 6 cores), so the cache is what makes agents
+usable: the system prompt is read once, not every turn or every restart.
 
 ### Hybrid CPU + GPU experts
 

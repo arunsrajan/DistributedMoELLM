@@ -259,12 +259,17 @@ function renderActive(g, batch) {
   const box = $("active");
   const summary = batch ? el("div", { class: "muted", style: "margin-bottom:8px;font-size:12px" },
     `batch ${batch.running} / ${batch.max_batch} running · ${batch.waiting} waiting · ` +
-    `average batch ${fmt(batch.avg_batch, 1)} over ${int(batch.steps)} steps`) : "";
+    `average batch ${fmt(batch.avg_batch, 1)} over ${int(batch.steps)} steps` +
+    (batch.prompt_cache ? ` · prompt cache: ${int(batch.prompt_cache.hits)} hits, ` +
+      `${int(batch.prompt_cache.tokens_saved)} tokens not re-read, ${int(batch.prompt_cache.disk_entries)} on disk ` +
+      `(${gib(batch.prompt_cache.disk_bytes)})` : "")) : "";
   if (!g.busy) { box.replaceChildren(summary, el("div", { class: "empty" }, "No request running.")); return; }
   const head = el("tr", {}, ...["Request", "Phase", "Prompt", "Generated", "tok/s"].map((h, i) => el("th", { class: i > 1 ? "num" : "" }, h)));
   const rows = g.active.map(a => el("tr", {},
     el("td", { class: "mono" }, a.id.slice(-6)), el("td", {}, a.phase),
-    el("td", { class: "num" }, int(a.prompt_tokens)), el("td", { class: "num" }, int(a.generated)),
+    el("td", { class: "num" }, a.phase === "prefill" && a.prompt_read != null
+        ? `${int(a.prompt_read)} / ${int(a.prompt_tokens)}` : int(a.prompt_tokens)),
+    el("td", { class: "num" }, int(a.generated)),
     el("td", { class: "num" }, a.decode_tok_s ? fmt(a.decode_tok_s, 2) : "–")));
   box.replaceChildren(summary, el("div", { class: "table-wrap" }, el("table", {}, head, ...rows)));
 }

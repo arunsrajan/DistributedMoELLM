@@ -18,7 +18,7 @@ import numpy as np
 
 from . import kernels
 from .config import ModelConfig, load_config
-from .experts import (CheckpointSource, ExpertStore, GroupQuant, Half16, default_format,
+from .experts import (_POOL, CheckpointSource, ExpertStore, GroupQuant, Half16, default_format,
                       expert_ffn, resident_bytes)
 from .safetensors_io import SafeTensorDir
 
@@ -28,6 +28,44 @@ def _mm(x: np.ndarray, w) -> np.ndarray:
     if isinstance(w, np.ndarray):
         return kernels.f32_matmul_t(x, w) if kernels.ENABLED and w.dtype == np.float32 else x @ w.T
     return w.matmul_t(x)
+
+
+ATTN_ROWS = 128  # query rows per attention task: bounds the score matrix of long prompts
+
+
+def _gqa_attention(q: np.ndarray, K: np.ndarray, V: np.ndarray, pos: np.ndarray, out: np.ndarray) -> None:
+    """Causal grouped-query attention of query rows ``q`` (m, H, hd) at
+    positions ``pos`` over the cached keys/values (KV, T, hd), into ``out``.
+
+    Long prompts are split into (KV head, row block) tasks run on threads
+    (BLAS releases the GIL), each looking only at keys up to its last row's
+    position, so memory stays at ``ATTN_ROWS`` rows' scores per task instead
+    of a (heads x prompt x prompt) matrix, and all cores work."""
+    m, H, hd = q.shape
+    KV = K.shape[0]
+    g = H // KV
+    scale = 1.0 / math.sqrt(hd)   # python float: stays f32
+
+    def task(kv: int, r0: int, r1: int) -> None:
+        mb, end = r1 - r0, int(pos[r1 - 1]) + 1
+        qb = q[r0:r1, kv * g:(kv + 1) * g].transpose(1, 0, 2).reshape(g * mb, hd) * scale
+        s = qb @ K[kv, :end].T                                            # (g*mb, end)
+        tail = min(end, mb)                                               # only the last keys can be future
+        future = np.arange(end - tail, end)[None, :] > pos[r0:r1, None]   # (mb, tail)
+        if future.any():
+            s[:, end - tail:][np.tile(future, (g, 1))] = -np.inf
+        s -= s.max(axis=1, keepdims=True)
+        np.exp(s, out=s)
+        o = s @ V[kv, :end]
+        o /= s.sum(axis=1, keepdims=True)          # normalize the small output, not the big matrix
+        out[r0:r1, kv * g:(kv + 1) * g] = o.reshape(g, mb, hd).transpose(1, 0, 2)
+
+    tasks = [(kv, r, min(r + ATTN_ROWS, m)) for kv in range(KV) for r in range(0, m, ATTN_ROWS)]
+    if len(tasks) <= KV or K.shape[1] * m < 65536:    # decode / short prompts: no thread hand-off
+        for t in tasks:
+            task(*t)
+    else:
+        list(_POOL.map(lambda t: task(*t), tasks))
 
 
 def rms_norm(x: np.ndarray, w: np.ndarray, eps: float) -> np.ndarray:
@@ -235,10 +273,12 @@ class KVCache:
         self.k = [np.zeros((heads, capacity, kd), np.float32) for _ in range(cfg.num_layers)]
         self.v = [np.zeros((heads, capacity, vd), np.float32) for _ in range(cfg.num_layers)]
 
-    def _grow(self, need: int) -> None:
+    def _grow(self, need: int, exact: bool = False) -> None:
         cap = self.cap
+        if exact:
+            cap = max(cap, -(-need // 256) * 256 + 256)   # a little headroom for the reply
         while cap < need:
-            cap *= 2
+            cap = int(cap * 1.5) // 256 * 256 + 256       # 1.5x: long contexts waste less RAM
         if cap == self.cap:
             return
         for lst in (self.k, self.v):
@@ -254,6 +294,11 @@ class KVCache:
         self.k[layer][:, start:start + n] = k
         self.v[layer][:, start:start + n] = v
         return self.k[layer][:, :start + n], self.v[layer][:, :start + n]
+
+    def reserve(self, need: int) -> None:
+        """Make room for ``need`` positions in one step (prompts of known length)."""
+        if need > self.cap:
+            self._grow(need, exact=True)
 
     def clone(self, length: int) -> "KVCache":
         """A new cache holding the first ``length`` positions of this one."""
@@ -438,18 +483,11 @@ class MoEModel:
             k = rms_norm(k, kn, cfg.rms_norm_eps)
         q = self.rotary(q, positions)
         k = self.rotary(k, positions)
-        g = H // KV
         out = np.empty((n, H, hd), np.float32)
         for a, b, cache in segs:
-            m, pos = b - a, positions[a:b]
+            pos = positions[a:b]
             K, V = cache.append(layer, k[a:b].transpose(1, 0, 2), v[a:b].transpose(1, 0, 2), int(pos[0]))
-            qg = q[a:b].transpose(1, 0, 2).reshape(KV, g * m, hd)        # heads sharing a KV head stacked
-            scores = (qg @ K.transpose(0, 2, 1)) * (1.0 / math.sqrt(hd))  # (KV, g*m, T); python float: f32
-            mask = np.arange(K.shape[1])[None, :] > pos[:, None]          # (m, T) causal
-            scores = np.where(np.tile(mask, (g, 1))[None], -np.inf, scores)
-            probs = softmax(scores, axis=-1)
-            o = (probs @ V).reshape(KV, g, m, hd)                         # (KV, g, m, hd)
-            out[a:b] = o.reshape(H, m, hd).transpose(1, 0, 2)
+            _gqa_attention(q[a:b], K, V, pos, out[a:b])
         return _mm(out.reshape(n, H * hd), L["o"])
 
     def _ffn(self, L, h, layer: int) -> np.ndarray:
@@ -473,14 +511,41 @@ class MoEModel:
         """Run ``tokens`` (appended after the cache) and return last-position logits."""
         return self.forward_batch([tokens], [cache])[0]
 
-    def forward_batch(self, token_lists, caches) -> np.ndarray:
+    PREFILL_CHUNK = 8192   # rows per pass when reading long prompts (attention is blocked anyway)
+
+    def forward_batch(self, token_lists, caches, on_progress=None) -> np.ndarray:
         """Advance several sequences at once, each by its own tokens and with its
         own KV cache; returns the last-position logits of each, (B, vocab).
 
         All rows go through every weight matrix together and each MoE layer is
         one backend call, so in a cluster every worker gets one request per
         layer for the whole batch, and an expert several sequences picked
-        decodes its weights once for all of them."""
+        decodes its weights once for all of them.
+
+        Long inputs (agent prompts run to 10k+ tokens) are read in passes of at
+        most ``PREFILL_CHUNK`` rows, so activations and attention scores stay
+        small; ``on_progress(done)`` gets each sequence's tokens read so far."""
+        token_lists = [list(t) for t in token_lists]
+        if sum(len(t) for t in token_lists) <= self.PREFILL_CHUNK:
+            return self._forward_pass(token_lists, caches)
+        for toks, cache in zip(token_lists, caches):
+            cache.reserve(cache.length + len(toks))      # one allocation, not one per pass
+        done = [0] * len(token_lists)
+        logits = [None] * len(token_lists)
+        while any(d < len(t) for d, t in zip(done, token_lists)):
+            live = [i for i, t in enumerate(token_lists) if done[i] < len(t)]
+            per = max(1, self.PREFILL_CHUNK // len(live))
+            chunks = [token_lists[i][done[i]:done[i] + per] for i in live]
+            out = self._forward_pass(chunks, [caches[i] for i in live])
+            for i, c, lg in zip(live, chunks, out):
+                done[i] += len(c)
+                if done[i] == len(token_lists[i]):
+                    logits[i] = lg
+            if on_progress:
+                on_progress(list(done))
+        return np.stack(logits)
+
+    def _forward_pass(self, token_lists, caches) -> np.ndarray:
         cfg = self.cfg
         segs, positions, start = [], [], 0
         for toks, cache in zip(token_lists, caches):
