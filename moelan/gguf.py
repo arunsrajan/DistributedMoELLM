@@ -14,8 +14,8 @@ moelan's own structures:
   Qwen / DeepSeek, SentencePiece for llama / Mixtral), and the chat template
   is the file's ``tokenizer.chat_template``.
 
-Architectures: ``qwen3moe``, ``qwen2moe`` and ``llama`` with experts
-(Mixtral). For llama, llama.cpp stores the query / key rows reordered for its
+Architectures: ``qwen3moe``, ``qwen2moe``, ``phimoe`` (Phi-3.5-MoE) and
+``llama`` with experts (Mixtral). For llama, llama.cpp stores the query / key rows reordered for its
 interleaved rotary layout; moelan applies interleaved rotary instead of
 reordering quantized rows. Quantizations: F32, F16, BF16, Q8_0, Q4_0, Q4_1,
 Q5_0, Q5_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
@@ -173,7 +173,8 @@ def open_gguf(path) -> GGUFFile:
 # Metadata -> HF-style config
 # ---------------------------------------------------------------------------
 
-_ARCHS = {"qwen3moe": "Qwen3MoeForCausalLM", "qwen2moe": "Qwen2MoeForCausalLM", "llama": "MixtralForCausalLM"}
+_ARCHS = {"qwen3moe": "Qwen3MoeForCausalLM", "qwen2moe": "Qwen2MoeForCausalLM", "llama": "MixtralForCausalLM",
+          "phimoe": "PhimoeForCausalLM"}
 
 
 def config_dict(path) -> dict:
@@ -200,17 +201,27 @@ def config_dict(path) -> dict:
         "hidden_size": hidden, "num_hidden_layers": int(k("block_count")),
         "num_attention_heads": heads, "num_key_value_heads": int(k("attention.head_count_kv", heads)),
         "head_dim": int(k("attention.key_length") or hidden // heads),
-        "rms_norm_eps": float(k("attention.layer_norm_rms_epsilon", 1e-6)),
+        "rms_norm_eps": float(k("attention.layer_norm_rms_epsilon", k("attention.layer_norm_epsilon", 1e-6))),
         "rope_theta": float(k("rope.freq_base", 10000.0)),
         "max_position_embeddings": int(k("context_length", 4096)),
         "bos_token_id": m.get("tokenizer.ggml.bos_token_id"),
         "eos_token_id": m.get("tokenizer.ggml.eos_token_id"),
         "tie_word_embeddings": "output.weight" not in g,
-        "intermediate_size": moe_inter if arch == "llama" else int(k("feed_forward_length", moe_inter)),
+        "intermediate_size": moe_inter if arch in ("llama", "phimoe") else int(k("feed_forward_length", moe_inter)),
     }
     n_exp, used = int(k("expert_count")), int(k("expert_used_count"))
-    if arch == "llama":
+    if arch in ("llama", "phimoe"):
         cfg.update(num_local_experts=n_exp, num_experts_per_tok=used)
+    if arch == "phimoe":
+        # not in the file: Phi-3.5-MoE's router_jitter_noise
+        cfg["router_jitter_noise"] = 0.01
+        if "rope_factors_short.weight" in g:   # LongRoPE as llama.cpp stores it
+            cfg["rope_scaling"] = {
+                "type": "longrope", "short_factor": g["rope_factors_short.weight"].array().tolist(),
+                "long_factor": g["rope_factors_long.weight"].array().tolist()
+                if "rope_factors_long.weight" in g else None,
+                "attention_factor": k("rope.scaling.attn_factor"),
+                "original_max_position_embeddings": k("rope.scaling.original_context_length")}
     else:
         cfg.update(num_experts=n_exp, num_experts_per_tok=used, moe_intermediate_size=moe_inter,
                    norm_topk_prob=bool(k("expert_weights_norm", arch == "qwen3moe")))
@@ -223,10 +234,11 @@ def config_dict(path) -> dict:
     for key in ("tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"):
         if m.get(key) is not None and m[key] not in eos:
             eos.append(m[key])
-    if tokens and "<|im_end|>" in tokens[:200000]:
-        i = tokens.index("<|im_end|>")
-        if i not in eos:
-            eos.append(i)
+    for end in ("<|im_end|>", "<|end|>"):     # Qwen's and Phi's
+        if end in tokens:
+            i = tokens.index(end)
+            if i not in eos:
+                eos.append(i)
     cfg["eos_token_id"] = eos
     layer0 = [t for t in ("blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight")
               if t in g]
@@ -460,12 +472,12 @@ def chat_template(path) -> str | None:
 # ---------------------------------------------------------------------------
 
 _LAYER_NAMES = {
-    "input_layernorm.weight": "attn_norm.weight",
-    "post_attention_layernorm.weight": "ffn_norm.weight",
+    "input_layernorm.weight": "attn_norm.weight", "input_layernorm.bias": "attn_norm.bias",
+    "post_attention_layernorm.weight": "ffn_norm.weight", "post_attention_layernorm.bias": "ffn_norm.bias",
     "self_attn.q_proj.weight": "attn_q.weight", "self_attn.k_proj.weight": "attn_k.weight",
     "self_attn.v_proj.weight": "attn_v.weight", "self_attn.o_proj.weight": "attn_output.weight",
     "self_attn.q_proj.bias": "attn_q.bias", "self_attn.k_proj.bias": "attn_k.bias",
-    "self_attn.v_proj.bias": "attn_v.bias",
+    "self_attn.v_proj.bias": "attn_v.bias", "self_attn.o_proj.bias": "attn_output.bias",
     "self_attn.q_norm.weight": "attn_q_norm.weight", "self_attn.k_norm.weight": "attn_k_norm.weight",
     "mlp.gate.weight": "ffn_gate_inp.weight", "block_sparse_moe.gate.weight": "ffn_gate_inp.weight",
     "mlp.shared_expert.gate_proj.weight": "ffn_gate_shexp.weight",
@@ -476,7 +488,8 @@ _LAYER_NAMES = {
     "mlp.down_proj.weight": "ffn_down.weight",
 }
 _GLOBAL_NAMES = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight",
-                 "lm_head.weight": "output.weight"}
+                 "model.norm.bias": "output_norm.bias", "lm_head.weight": "output.weight",
+                 "lm_head.bias": "output.bias"}
 
 
 class GGUFNames:

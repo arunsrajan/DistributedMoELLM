@@ -73,6 +73,13 @@ def rms_norm(x: np.ndarray, w: np.ndarray, eps: float) -> np.ndarray:
     return x / np.sqrt(var + eps) * w
 
 
+def layer_norm(x: np.ndarray, w: np.ndarray, b: np.ndarray | None, eps: float) -> np.ndarray:
+    mu = np.mean(x, axis=-1, keepdims=True)
+    d = x - mu
+    y = d / np.sqrt(np.mean(d * d, axis=-1, keepdims=True) + eps) * w
+    return y + b if b is not None else y
+
+
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     x = x - x.max(axis=axis, keepdims=True)
     e = np.exp(x)
@@ -89,9 +96,14 @@ class Rotary:
     ``interleaved``: the weights store each rotated pair side by side (DeepSeek
     MLA); the vector is de-interleaved first, as in DeepSeek's
     ``apply_rotary_pos_emb``. ``rope_scaling`` of type ``yarn`` follows
-    DeepSeek's YaRN: blended frequencies and a cos/sin magnitude scale."""
+    DeepSeek's YaRN: blended frequencies and a cos/sin magnitude scale.
+    ``longrope`` (Phi-3.5): per-frequency ``short_factor`` divisors and the
+    short magnitude scale, as transformers applies them (the long factors
+    are its choice only when a single call covers more than the original
+    context, which a KV cache cannot switch to mid-sequence)."""
 
-    def __init__(self, dim: int, theta: float, scaling: dict | None = None, interleaved: bool = False):
+    def __init__(self, dim: int, theta: float, scaling: dict | None = None, interleaved: bool = False,
+                 max_position: int = 0):
         self.dim, self.interleaved = dim, interleaved
         exps = np.arange(0, dim, 2, dtype=np.float64) / dim
         inv = 1.0 / theta ** exps
@@ -112,6 +124,14 @@ class Rotary:
             extra_mask = 1.0 - ramp
             inv = inv / f * (1 - extra_mask) + inv * extra_mask
             self.mscale = _yarn_mscale(f, scaling.get("mscale", 1)) /                 _yarn_mscale(f, scaling.get("mscale_all_dim", 0))
+        elif kind in ("longrope", "su"):
+            inv = inv / np.asarray(scaling["short_factor"], np.float64)
+            orig = scaling.get("original_max_position_embeddings") or max_position
+            m = scaling.get("short_mscale") or scaling.get("attention_factor")
+            if m is None:                       # transformers' default from the context ratio
+                f = scaling.get("factor") or (max_position / orig if orig else 1.0)
+                m = math.sqrt(1 + math.log(f) / math.log(orig)) if f > 1 else 1.0
+            self.mscale = float(m)
         self.inv = inv
 
     def __call__(self, x: np.ndarray, positions: np.ndarray) -> np.ndarray:
@@ -179,6 +199,28 @@ def route_grouped(logits: np.ndarray, cfg: ModelConfig, bias: np.ndarray | None)
     else:
         w = w * cfg.routed_scaling_factor
     return idx.astype(np.int32), w.astype(np.float32)
+
+
+def route_sparsemixer(logits: np.ndarray, eps: float) -> tuple[np.ndarray, np.ndarray]:
+    """PhiMoE's top-2 router at inference. Each pick: the best remaining
+    expert, weighted by its softmax among the experts whose logit is within a
+    relative ``2*eps`` of it (the rest masked out); the second pick masks the
+    first. Weights are not renormalized."""
+    s = logits.astype(np.float32)
+    n = s.shape[0]
+    rows = np.arange(n)
+    idx = np.empty((n, 2), np.int32)
+    w = np.empty((n, 2), np.float32)
+    left = s.copy()
+    with np.errstate(invalid="ignore", divide="ignore"):
+        for j in range(2):
+            top = left.argmax(-1)
+            best = left[rows, top][:, None]
+            far = (best - s) / np.maximum(np.abs(s), best) > 2 * eps
+            w[:, j] = softmax(np.where(far, -np.inf, left))[rows, top]
+            idx[:, j] = top
+            left[rows, top] = -np.inf
+    return idx, w
 
 
 def group_by_expert(idx: np.ndarray, w: np.ndarray):
@@ -363,6 +405,7 @@ class MoEModel:
         else:
             self.embed = st.get("model.embed_tokens.weight", dtype=None)  # only rows are read: keep as stored
         self.norm = st.get("model.norm.weight")
+        self.norm_b, self.lm_head_b = opt("model.norm.bias"), opt("lm_head.bias")
         self.lm_head = big("model.embed_tokens.weight"
                            if cfg.tie_word_embeddings or "lm_head.weight" not in st else "lm_head.weight")
         if cfg.attention == "mla":
@@ -373,7 +416,10 @@ class MoEModel:
                 m = _yarn_mscale(float(rs["factor"]), rs["mscale_all_dim"])
                 self.softmax_scale *= m * m
         else:
-            self.rotary = Rotary(cfg.head_dim, cfg.rope_theta, interleaved=cfg.rope_interleaved)
+            rs = cfg.rope_scaling or {}
+            longrope = (rs.get("type") or rs.get("rope_type")) in ("longrope", "su")
+            self.rotary = Rotary(cfg.head_dim, cfg.rope_theta, rs if longrope else None,
+                                 interleaved=cfg.rope_interleaved, max_position=cfg.max_position_embeddings)
         self.layers = []
         for i in range(cfg.num_layers):
             p = f"model.layers.{i}"
@@ -381,7 +427,9 @@ class MoEModel:
             L = {
                 "in_norm": st.get(f"{p}.input_layernorm.weight"),
                 "post_norm": st.get(f"{p}.post_attention_layernorm.weight"),
-                "o": big(f"{a}.o_proj.weight"),
+                "in_norm_b": opt(f"{p}.input_layernorm.bias"),
+                "post_norm_b": opt(f"{p}.post_attention_layernorm.bias"),
+                "o": big(f"{a}.o_proj.weight"), "ob": opt(f"{a}.o_proj.bias"),
             }
             if cfg.attention == "mla":
                 if cfg.q_lora_rank:
@@ -505,7 +553,8 @@ class MoEModel:
             pos = positions[a:b]
             K, V = cache.append(layer, k[a:b].transpose(1, 0, 2), v[a:b].transpose(1, 0, 2), int(pos[0]))
             _gqa_attention(q[a:b], K, V, pos, out[a:b])
-        return _mm(out.reshape(n, H * hd), L["o"])
+        o = _mm(out.reshape(n, H * hd), L["o"])
+        return o + L["ob"] if L["ob"] is not None else o
 
     def _ffn(self, L, h, layer: int) -> np.ndarray:
         cfg = self.cfg
@@ -514,6 +563,8 @@ class MoEModel:
         logits = h @ L["router"].T
         if cfg.family.startswith("deepseek"):
             idx, w = route_grouped(logits, cfg, L.get("router_bias"))
+        elif cfg.topk_method == "sparsemixer":
+            idx, w = route_sparsemixer(logits, cfg.router_jitter)
         else:
             idx, w = route(logits, cfg.top_k, cfg.norm_topk_prob)
         y = self.backend.moe(layer, h, idx, w)
@@ -584,17 +635,23 @@ class MoEModel:
         tokens = np.concatenate([np.asarray(t, dtype=np.int64) for t in token_lists])
         x = self.embed[tokens].astype(np.float32)
         for i, L in enumerate(self.layers):
-            h = rms_norm(x, L["in_norm"], cfg.rms_norm_eps)
+            h = self._norm(x, L["in_norm"], L["in_norm_b"])
             x = x + self._attention(L, h, positions, segs, i)
-            h = rms_norm(x, L["post_norm"], cfg.rms_norm_eps)
+            h = self._norm(x, L["post_norm"], L["post_norm_b"])
             x = x + self._ffn(L, h, i)
             if after_layer:
                 after_layer((i + 1) / len(self.layers))
         for a, b, cache in segs:
             cache.length += b - a
         last = np.array([b - 1 for _, b, _ in segs])
-        x = rms_norm(x[last], self.norm, cfg.rms_norm_eps)
-        return _mm(x, self.lm_head)
+        x = self._norm(x[last], self.norm, self.norm_b)
+        y = _mm(x, self.lm_head)
+        return y + self.lm_head_b if self.lm_head_b is not None else y
+
+    def _norm(self, x, w, b):
+        if self.cfg.norm_type == "layer":
+            return layer_norm(x, w, b, self.cfg.rms_norm_eps)
+        return rms_norm(x, w, self.cfg.rms_norm_eps)
 
     def generate(self, prompt_ids, max_new_tokens: int = 64, temperature: float = 0.0,
                  top_p: float = 1.0, top_k: int = 0, seed: int | None = None,

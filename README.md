@@ -87,8 +87,9 @@ that already fits.
 Supported checkpoints (HF safetensors, F32/F16/BF16, and GGUF files - see
 below): **Mixtral**,
 **Qwen2-MoE**, **Qwen3-MoE** (Qwen3-30B-A3B, Qwen3-Coder-30B-A3B, ...),
-**OLMoE**, **DeepSeek V2 / V2-Lite / V2.5** and **DeepSeek V3 / R1 layouts**
-(`DeepseekV3ForCausalLM`, which Kimi K2 also uses), plus colibri int4
+**OLMoE**, **PhiMoE** (Phi-3.5-MoE-instruct), **DeepSeek V2 / V2-Lite / V2.5**
+and **DeepSeek V3 / R1 layouts** (`DeepseekV3ForCausalLM`, which Kimi K2 also
+uses), plus colibri int4
 containers of Qwen3-MoE (e.g. `Justvugg/Qwen3-Coder-30B-A3B-colibri-int4`).
 
 DeepSeek specifics: multi-head latent attention with the compressed KV cache
@@ -100,6 +101,15 @@ coordinator as part of the dense model), the dense first layers
 `group_limited_greedy`, and V3 `noaux_tc` (sigmoid scores plus
 `e_score_correction_bias`, top groups by the sum of their two best experts,
 `routed_scaling_factor`). Only the routed experts are distributed.
+
+PhiMoE specifics: LayerNorm with bias instead of RMSNorm, biases on the
+attention projections and the output head, LongRoPE (`short_factor`
+frequencies and `short_mscale`, as transformers applies them; prompts past
+the original 4k context keep the short factors because a KV cache cannot
+switch mid-sequence), and the *sparsemixer* top-2 router: each pick is
+weighted by its softmax among the experts within 2 x `router_jitter_noise` of
+it, without renormalizing. Logits match transformers' `PhimoeForCausalLM` on
+a tiny random checkpoint, and the router matches its `sparsemixer` exactly.
 
 Not yet: the official FP8 DeepSeek-V3 / Kimi K2 releases (use a BF16
 conversion), V3's multi-token-prediction layer (ignored), GLM, Qwen3-Next,
@@ -114,8 +124,11 @@ non-DeepSeek families.
 python -m moelan serve --model ~/models/Qwen3-30B-A3B-Q4_K_M.gguf
 ```
 
-* **Architectures:** `qwen3moe`, `qwen2moe`, and `llama` with experts
-  (Mixtral). DeepSeek GGUFs are not supported yet.
+* **Architectures:** `qwen3moe`, `qwen2moe`, `phimoe` (Phi-3.5-MoE), and
+  `llama` with experts (Mixtral). DeepSeek GGUFs are not supported yet. For
+  `phimoe`, the file's `rope.scaling.attn_factor` is used (llama.cpp's
+  value, a little below the HF `short_mscale`), and routing is the exact
+  sparsemixer, as in transformers.
 * **Quantizations:** F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K,
   Q4_K, Q5_K, Q6_K (so Q4_K_M, Q5_K_M, Q6_K, Q8_0 ... files). IQ formats are
   not supported yet and are named in the error.

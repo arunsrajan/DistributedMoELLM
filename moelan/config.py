@@ -9,6 +9,8 @@ Supported (HF transformers layouts, safetensors weights):
                                                      (group-limited) routing, dense first layers
   * DeepSeek V3      (``DeepseekV3ForCausalLM``)     as V2 with sigmoid routing + correction bias,
                                                      node-limited groups (also Kimi K2, BF16 only)
+  * PhiMoE           (``PhimoeForCausalLM``)         Phi-3.5-MoE: Mixtral names, LayerNorm, biases,
+                                                     LongRoPE, sparsemixer top-2 routing
   * colibri int4 containers of the above (``qwen36_meta.json`` + ``merged_weight``/``qs``)
   * moelan-tiny      (random test model written by ``moelan make-tiny``; Qwen3-MoE layout)
 """
@@ -60,11 +62,13 @@ class ModelConfig:
     v_head_dim: int = 0
     rope_scaling: dict | None = None
     rope_interleaved: bool = False      # rotary pairs stored side by side (GGUF llama, DeepSeek MLA)
+    norm_type: str = "rms"              # "rms", or "layer" (LayerNorm with bias: PhiMoE)
+    router_jitter: float = 0.0          # sparsemixer's relative threshold (topk_method "sparsemixer")
     raw: dict = field(default_factory=dict, repr=False)
 
     # ---- tensor names -------------------------------------------------
     def _mlp(self, layer: int) -> str:
-        if self.family == "mixtral":
+        if self.family in ("mixtral", "phimoe"):
             return f"model.layers.{layer}.block_sparse_moe"
         return f"model.layers.{layer}.mlp"
 
@@ -77,7 +81,7 @@ class ModelConfig:
         p = f"{self._mlp(layer)}.experts.{expert}"
         if self.expert_layout == "colibri_int4":
             return f"{p}.merged_weight", f"{p}.qs"
-        if self.family == "mixtral":
+        if self.family in ("mixtral", "phimoe"):
             return f"{p}.w1.weight", f"{p}.w3.weight", f"{p}.w2.weight"
         return f"{p}.gate_proj.weight", f"{p}.up_proj.weight", f"{p}.down_proj.weight"
 
@@ -119,6 +123,7 @@ _FAMILIES = {
     "MoelanTinyForCausalLM": "qwen3_moe",
     "DeepseekV2ForCausalLM": "deepseek_v2",
     "DeepseekV3ForCausalLM": "deepseek_v3",
+    "PhimoeForCausalLM": "phimoe",
 }
 
 
@@ -136,10 +141,15 @@ def load_config(model_dir: str | Path) -> ModelConfig:
     heads = raw["num_attention_heads"]
     layers = raw["num_hidden_layers"]
     extra: dict = {}
-    if family == "mixtral":
+    if family in ("mixtral", "phimoe"):
         n_exp, top_k = raw["num_local_experts"], raw["num_experts_per_tok"]
         moe_inter = raw["intermediate_size"]
         norm_topk = True
+        if family == "phimoe":
+            if top_k != 2:
+                raise ValueError(f"PhiMoE's sparsemixer routing picks 2 experts, not {top_k}")
+            extra = dict(norm_type="layer", topk_method="sparsemixer",
+                         router_jitter=float(raw.get("router_jitter_noise", 0.01)))
     elif family.startswith("deepseek"):
         v3 = family == "deepseek_v3"
         n_exp, top_k = raw["n_routed_experts"], raw["num_experts_per_tok"]
@@ -201,11 +211,11 @@ def load_config(model_dir: str | Path) -> ModelConfig:
         moe_intermediate_size=moe_inter,
         intermediate_size=raw.get("intermediate_size", 0),
         rms_norm_eps=raw.get("rms_norm_eps", 1e-6),
-        rope_theta=raw.get("rope_theta", 10000.0),
+        rope_theta=raw.get("rope_theta", (raw.get("rope_parameters") or {}).get("rope_theta", 10000.0)),
         norm_topk_prob=bool(norm_topk),
         tie_word_embeddings=raw.get("tie_word_embeddings", False),
         shared_expert_intermediate_size=raw.get("shared_expert_intermediate_size", 0) or 0,
-        rope_scaling=raw.get("rope_scaling"),
+        rope_scaling=raw.get("rope_scaling") or _rope_parameters(raw),
         dense_layers=sorted(set(dense_layers)),
         max_position_embeddings=raw.get("max_position_embeddings", 4096),
         bos_token_id=raw.get("bos_token_id"),
@@ -221,6 +231,14 @@ def load_config(model_dir: str | Path) -> ModelConfig:
         cfg.num_kv_heads = heads
         cfg.head_dim = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim  # query/key head size
     return cfg
+
+
+def _rope_parameters(raw: dict) -> dict | None:
+    """transformers 5 writes ``rope_parameters`` instead of ``rope_scaling``."""
+    rp = raw.get("rope_parameters")
+    if isinstance(rp, dict) and rp.get("rope_type", "default") != "default":
+        return rp
+    return None
 
 
 def model_fingerprint(model_dir: str | Path) -> str:

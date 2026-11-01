@@ -206,3 +206,91 @@ def test_real_llama_cpp_gguf_matches_safetensors():
         assert greedy(m, ids, 24) == ref, name
         tok = Tokenizer(STORIES / name)                                 # rebuilt from the GGUF vocabulary
         assert tok.encode("  Hello  world!\n    def f(x):") == Tokenizer(STORIES).encode("  Hello  world!\n    def f(x):")
+
+
+def write_tiny_phimoe_gguf(tmp: Path):
+    """A PhiMoE GGUF the way llama.cpp lays it out (LayerNorm and projection
+    biases, rope_factors tensors, K-quant experts) plus its safetensors twin."""
+    from moelan.tiny import make_tiny_phimoe
+    hf = make_tiny_phimoe(tmp / "src", hidden=256, inter=256, layers=2, experts=4, seed=5, bf16=False)
+    st, cfg = SafeTensorDir(hf), load_config(hf)
+    twin = {n: st.get(n) for n in st.keys()}
+    rs, rng = cfg.rope_scaling, np.random.default_rng(2)
+    w = gguf.GGUFWriter(str(tmp / "tiny-phimoe.gguf"), "phimoe")
+    w.add_block_count(cfg.num_layers)
+    w.add_context_length(cfg.max_position_embeddings)
+    w.add_embedding_length(cfg.hidden_size)
+    w.add_feed_forward_length(cfg.moe_intermediate_size)
+    w.add_head_count(cfg.num_heads)
+    w.add_head_count_kv(cfg.num_kv_heads)
+    w.add_layer_norm_rms_eps(cfg.rms_norm_eps)
+    w.add_rope_freq_base(cfg.rope_theta)
+    w.add_rope_scaling_attn_factors(rs["short_mscale"])
+    w.add_rope_scaling_orig_ctx_len(rs["original_max_position_embeddings"])
+    w.add_expert_count(cfg.num_experts)
+    w.add_expert_used_count(cfg.top_k)
+    w.add_tokenizer_model("gpt2")
+    w.add_tokenizer_pre("qwen2")
+    w.add_token_list(_byte_vocab()[:256] + ["<|endoftext|>", "<|end|>"])
+    w.add_token_types([1] * 256 + [3, 3])
+    w.add_token_merges([])
+    w.add_bos_token_id(256)
+    w.add_eos_token_id(256)
+
+    def put(name, arr, qtype="F32"):
+        if qtype == "F32":
+            w.add_tensor(name, arr.astype(np.float32))
+            return arr.astype(np.float32)
+        q = gguf.quants.quantize(arr.astype(np.float32), Q[qtype])
+        w.add_tensor(name, q, raw_shape=q.shape, raw_dtype=Q[qtype])
+        return gguf.quants.dequantize(q, Q[qtype]).astype(np.float32).reshape(arr.shape)
+
+    put("token_embd.weight", twin["model.embed_tokens.weight"])
+    put("rope_factors_short.weight", np.array(rs["short_factor"]))
+    put("rope_factors_long.weight", np.array(rs["long_factor"]))
+    twin["lm_head.weight"] = put("output.weight", twin["lm_head.weight"], "Q8_0")
+    for n, g in (("lm_head.bias", "output.bias"), ("model.norm.weight", "output_norm.weight"),
+                 ("model.norm.bias", "output_norm.bias")):
+        put(g, twin[n])
+    for i in range(cfg.num_layers):
+        p, b = f"model.layers.{i}", f"blk.{i}"
+        for hf_name, g_name in (("input_layernorm", "attn_norm"), ("post_attention_layernorm", "ffn_norm")):
+            put(f"{b}.{g_name}.weight", twin[f"{p}.{hf_name}.weight"])
+            put(f"{b}.{g_name}.bias", twin[f"{p}.{hf_name}.bias"])
+        for hf_name, g_name in (("q_proj", "attn_q"), ("k_proj", "attn_k"), ("v_proj", "attn_v"),
+                                ("o_proj", "attn_output")):
+            a = f"{p}.self_attn.{hf_name}"
+            twin[f"{a}.weight"] = put(f"{b}.{g_name}.weight", twin[f"{a}.weight"], "Q8_0")
+            put(f"{b}.{g_name}.bias", twin[f"{a}.bias"])
+        m = f"{p}.block_sparse_moe"
+        put(f"{b}.ffn_gate_inp.weight", twin[f"{m}.gate.weight"])
+        for part, hf_w, qname in (("gate", "w1", "Q4_K"), ("up", "w3", "Q5_K"), ("down", "w2", "Q6_K")):
+            rows, cols = twin[f"{m}.experts.0.{hf_w}.weight"].shape     # gguf-py cannot write K-quants
+            raw = np.stack([random_blocks(rows, cols, QTYPE_IDS[qname], rng, scale=0.004)
+                            for _ in range(cfg.num_experts)])
+            w.add_tensor(f"{b}.ffn_{part}_exps.weight", raw, raw_shape=raw.shape, raw_dtype=Q[qname])
+            vals = gguf.quants.dequantize(raw, Q[qname]).astype(np.float32).reshape(-1, rows, cols)
+            for e in range(cfg.num_experts):
+                twin[f"{m}.experts.{e}.{hf_w}.weight"] = vals[e]
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+    tw = tmp / "twin"
+    tw.mkdir()
+    save_file(twin, tw / "model.safetensors")
+    (tw / "config.json").write_text((hf / "config.json").read_text())
+    return tmp / "tiny-phimoe.gguf", tw
+
+
+def test_phimoe_gguf_matches_its_twin(tmp_path):
+    path, twin = write_tiny_phimoe_gguf(tmp_path)
+    a, b = load_config(path), load_config(twin)
+    assert a.family == b.family == "phimoe" and a.norm_type == "layer" and a.topk_method == "sparsemixer"
+    assert a.rope_scaling["short_factor"] == pytest.approx(b.rope_scaling["short_factor"])
+    assert 257 in a.eos_token_ids                                       # <|end|>
+    toks = [256] + list(b"phi experts in k-quants")
+    g, t = MoEModel(path), MoEModel(twin)
+    x, y = g.forward(toks, g.new_cache()), t.forward(toks, t.new_cache())
+    np.testing.assert_allclose(x, y, atol=2e-3 * np.abs(y).max())
+    assert greedy(g, toks, 10) == greedy(t, toks, 10)

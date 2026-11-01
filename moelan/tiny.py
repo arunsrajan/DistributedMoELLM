@@ -184,3 +184,56 @@ def make_tiny_deepseek(out_dir: str | Path, version: int = 3, hidden: int = 64, 
                    aux_loss_alpha=0.001, seq_aux=True)
     (out / "config.json").write_text(json.dumps(cfg, indent=2))
     return out
+
+
+def make_tiny_phimoe(out_dir: str | Path, hidden: int = 64, layers: int = 3, experts: int = 8,
+                     inter: int = 96, heads: int = 4, kv_heads: int = 2, seed: int = 0,
+                     bf16: bool = True) -> Path:
+    """A random PhiMoE (Phi-3.5-MoE) checkpoint: Mixtral tensor names plus
+    LayerNorm and projection biases, LongRoPE and sparsemixer routing."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    vocab, hd = 258, hidden // heads
+
+    def w(*shape, scale=None):
+        s = scale if scale is not None else 1.0 / np.sqrt(shape[-1])
+        return (rng.standard_normal(shape) * s).astype(np.float32)
+
+    def norm(n):
+        return (1 + 0.1 * rng.standard_normal(n)).astype(np.float32)
+
+    t = {"model.embed_tokens.weight": w(vocab, hidden, scale=0.5), "model.norm.weight": norm(hidden),
+         "model.norm.bias": w(hidden, scale=0.1), "lm_head.weight": w(vocab, hidden),
+         "lm_head.bias": w(vocab, scale=0.1)}
+    for i in range(layers):
+        p, a = f"model.layers.{i}", f"model.layers.{i}.self_attn"
+        for n in ("input_layernorm", "post_attention_layernorm"):
+            t[f"{p}.{n}.weight"], t[f"{p}.{n}.bias"] = norm(hidden), w(hidden, scale=0.1)
+        for n, rows in (("q", heads * hd), ("k", kv_heads * hd), ("v", kv_heads * hd)):
+            t[f"{a}.{n}_proj.weight"], t[f"{a}.{n}_proj.bias"] = w(rows, hidden), w(rows, scale=0.1)
+        t[f"{a}.o_proj.weight"], t[f"{a}.o_proj.bias"] = w(hidden, heads * hd), w(hidden, scale=0.1)
+        m = f"{p}.block_sparse_moe"
+        t[f"{m}.gate.weight"] = w(experts, hidden, scale=0.3)
+        for e in range(experts):
+            q = f"{m}.experts.{e}"
+            t[f"{q}.w1.weight"], t[f"{q}.w3.weight"] = w(inter, hidden), w(inter, hidden)
+            t[f"{q}.w2.weight"] = w(hidden, inter)
+    save_file(t, out / "model.safetensors",
+              bf16={n for n in t if n.endswith("proj.weight") or ".w" in n} if bf16 else None)
+    cfg = {
+        "architectures": ["PhimoeForCausalLM"], "model_type": "phimoe",
+        "vocab_size": vocab, "hidden_size": hidden, "intermediate_size": inter,
+        "num_hidden_layers": layers, "num_attention_heads": heads, "num_key_value_heads": kv_heads,
+        "num_local_experts": experts, "num_experts_per_tok": 2, "router_jitter_noise": 0.01,
+        "input_jitter_noise": 0.0, "hidden_act": "silu", "attention_bias": True, "lm_head_bias": True,
+        "max_position_embeddings": 4096, "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+        "rope_scaling": {"type": "longrope", "short_factor": (1 + rng.random(hd // 2)).round(4).tolist(),
+                         "long_factor": (2 + 4 * rng.random(hd // 2)).round(4).tolist(),
+                         "short_mscale": 1.243, "long_mscale": 1.243,
+                         "original_max_position_embeddings": 512},
+        "sliding_window": None, "attention_dropout": 0.0, "tie_word_embeddings": False,
+        "bos_token_id": 256, "eos_token_id": 257, "torch_dtype": "float32",
+    }
+    (out / "config.json").write_text(json.dumps(cfg, indent=2))
+    return out
