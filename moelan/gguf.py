@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import mmap
 import struct
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -286,9 +287,20 @@ class QuantMatrix:
     def matmul_t(self, x: np.ndarray) -> np.ndarray:
         if kernels.ENABLED and x.shape[0] < kernels.BLAS_FROM:
             return kernels.gguf_matmul_t(x, self.raw, self.qtype, self.shape[1])
-        from .experts import _scratch
-        _, f = _scratch(*self.shape)
-        return x @ dequantize(self.raw, self.qtype, self.shape[1], f).T
+        from .experts import _POOL, _scratch
+        if not kernels.ENABLED or threading.current_thread().name.startswith("moelan-blas"):
+            _, f = _scratch(*self.shape)
+            return x @ dequantize(self.raw, self.qtype, self.shape[1], f).T
+        # prompts: decode and multiply row blocks on parallel threads (the
+        # decoder and each BLAS call single-threaded), so all cores work
+        O, cols = self.shape
+        step = max(64, -(-O // (4 * _POOL._max_workers)))
+        y = np.empty((x.shape[0], O), np.float32)
+
+        def block(r):
+            y[:, r:r + step] = x @ dequantize(self.raw[r:r + step], self.qtype, cols).T
+        list(_POOL.map(block, range(0, O, step)))
+        return y
 
     def dequant(self) -> np.ndarray:
         return dequantize(self.raw, self.qtype, self.shape[1])

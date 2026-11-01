@@ -133,11 +133,15 @@ python -m moelan serve --model ~/models/Qwen3-30B-A3B-Q4_K_M.gguf
   Q4_K, Q5_K, Q6_K (so Q4_K_M, Q5_K_M, Q6_K, Q8_0 ... files). IQ formats are
   not supported yet and are named in the error.
 * **Weights stay as stored.** Experts and attention weights are multiplied
-  straight from the GGUF blocks (compiled kernels: fused ones for Q8_0, Q4_K,
-  Q5_K, Q6_K when generating, decode-once-per-row otherwise, BLAS for long
-  prompts); a layer's stacked experts are sliced per expert without copying,
-  and workers receive and cache each expert's raw blocks. One Q4_K_M expert
-  of Qwen3-30B's shape takes 0.34 ms here, against 0.30 ms for colibri int4.
+  straight from the GGUF blocks (compiled kernels: fused ones for Q8_0, Q2_K,
+  Q3_K, Q4_K, Q5_K, Q6_K when generating, decode-once-per-row otherwise,
+  row blocks decoded and multiplied by BLAS on all cores for long prompts); a
+  layer's stacked experts are sliced per expert without copying, and workers
+  receive and cache each expert's raw blocks. One Q4_K_M expert of
+  Qwen3-30B's shape takes 0.34 ms here, against 0.30 ms for colibri int4.
+  Phi-3.5-MoE-instruct Q2_K on one 6-core laptop (Ryzen 5 5500U) generates
+  1.7-1.9 tok/s (0.56 before the Q2_K / Q3_K kernels); it computes about
+  twice Qwen3-30B-A3B's work per token (2 of 16 experts of 4096 x 6400).
 * **Tokenizer and chat template from the file:** byte-level BPE (Qwen,
   DeepSeek) or SentencePiece (llama / Mixtral, including files whose scores
   were written as placeholders), special tokens kept whole. `--tokenizer

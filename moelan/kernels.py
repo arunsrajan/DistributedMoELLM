@@ -564,6 +564,87 @@ if ENABLED:
         return y
 
     @njit(parallel=True, fastmath=True, cache=True, nogil=True)
+    def _mv_q2_k(x, raw, xs):
+        # each byte holds one value of 4 groups 32 apart: one pass, four sums;
+        # per 16-value group d*sc*sum(q*x) - dmin*m*sum(x), xs = per-16 sums of x
+        n, cols = x.shape
+        O = raw.shape[0]
+        y = np.empty((n, O), np.float32)
+        for o in prange(O):
+            row = raw[o]
+            for r in range(n):
+                acc = np.float32(0.0)
+                for b in range(cols // 256):
+                    p = b * 84
+                    d = _f16(row[p + 80], row[p + 81])
+                    dmin = _f16(row[p + 82], row[p + 83])
+                    for h in range(2):
+                        for sub in range(2):
+                            q = p + 16 + h * 32 + sub * 16
+                            x0 = b * 256 + h * 128 + sub * 16
+                            s0 = np.float32(0.0)
+                            s1 = np.float32(0.0)
+                            s2 = np.float32(0.0)
+                            s3 = np.float32(0.0)
+                            for l in range(16):
+                                v = np.int32(row[q + l])
+                                s0 += np.float32(v & 3) * x[r, x0 + l]
+                                s1 += np.float32((v >> 2) & 3) * x[r, x0 + 32 + l]
+                                s2 += np.float32((v >> 4) & 3) * x[r, x0 + 64 + l]
+                                s3 += np.float32(v >> 6) * x[r, x0 + 96 + l]
+                            sp = p + h * 8 + sub
+                            g = x0 // 16
+                            for j, sj in ((0, s0), (1, s1), (2, s2), (3, s3)):
+                                sc = np.int32(row[sp + 2 * j])
+                                acc += d * np.float32(sc & 15) * sj - dmin * np.float32(sc >> 4) * xs[r, g + 2 * j]
+                y[r, o] = acc
+        return y
+
+    @njit(inline="always")
+    def _q3_scale(row, p, i):
+        """6-bit scale i (0..15) of a Q3_K block, unpacked as dequantize_row_q3_K does."""
+        w, k = i // 4, i % 4
+        lo = np.int32(row[p + 96 + (w & 1) * 4 + k])
+        lo = (lo & 15) if w < 2 else (lo >> 4)
+        return (lo | (((np.int32(row[p + 104 + k]) >> (2 * w)) & 3) << 4)) - 32
+
+    @njit(parallel=True, fastmath=True, cache=True, nogil=True)
+    def _mv_q3_k(x, raw):
+        n, cols = x.shape
+        O = raw.shape[0]
+        y = np.empty((n, O), np.float32)
+        for o in prange(O):
+            row = raw[o]
+            for r in range(n):
+                acc = np.float32(0.0)
+                for b in range(cols // 256):
+                    p = b * 110
+                    d = _f16(row[p + 108], row[p + 109])
+                    for h in range(2):
+                        for sub in range(2):
+                            q = p + 32 + h * 32 + sub * 16
+                            hm = p + sub * 16
+                            x0 = b * 256 + h * 128 + sub * 16
+                            s0 = np.float32(0.0)
+                            s1 = np.float32(0.0)
+                            s2 = np.float32(0.0)
+                            s3 = np.float32(0.0)
+                            for l in range(16):
+                                v = np.int32(row[q + l])
+                                m = np.int32(row[hm + l]) >> (4 * h)    # this half's 4 high bits
+                                s0 += np.float32((v & 3) - 4 + ((m & 1) << 2)) * x[r, x0 + l]
+                                s1 += np.float32(((v >> 2) & 3) - 4 + ((m & 2) << 1)) * x[r, x0 + 32 + l]
+                                s2 += np.float32(((v >> 4) & 3) - 4 + (m & 4)) * x[r, x0 + 64 + l]
+                                s3 += np.float32((v >> 6) - 4 + ((m & 8) >> 1)) * x[r, x0 + 96 + l]
+                            i = h * 8 + sub
+                            acc += d * (np.float32(_q3_scale(row, p, i)) * s0
+                                        + np.float32(_q3_scale(row, p, i + 2)) * s1
+                                        + np.float32(_q3_scale(row, p, i + 4)) * s2
+                                        + np.float32(_q3_scale(row, p, i + 6)) * s3)
+                y[r, o] = acc
+        return y
+
+    @njit(parallel=True, fastmath=True, cache=True, nogil=True)
     def _gguf_mm(x, raw, qtype, cols):
         n = x.shape[0]
         O = raw.shape[0]
@@ -604,6 +685,10 @@ def gguf_matmul_t(x: np.ndarray, raw: np.ndarray, qtype: int, cols: int) -> np.n
         if qtype == 12 or qtype == 13:
             xs = x.reshape(x.shape[0], -1, 32).sum(axis=2)
             return (_mv_q4_k if qtype == 12 else _mv_q5_k)(x, raw, xs)
+        if qtype == 10:
+            return _mv_q2_k(x, raw, x.reshape(x.shape[0], -1, 16).sum(axis=2))
+        if qtype == 11:
+            return _mv_q3_k(x, raw)
         if qtype == 14:
             return _mv_q6_k(x, raw)
         if qtype == 8:
