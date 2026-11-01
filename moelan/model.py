@@ -18,7 +18,7 @@ import numpy as np
 
 from . import kernels
 from .config import ModelConfig, load_config
-from .experts import (_POOL, CheckpointSource, ExpertStore, GroupQuant, Half16, default_format,
+from .experts import (_POOL, ExpertStore, GroupQuant, Half16, default_format, open_source,
                       expert_ffn, resident_bytes)
 from .safetensors_io import SafeTensorDir
 
@@ -329,15 +329,24 @@ class MoEModel:
                  gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto"):
         self.model_dir = Path(model_dir)
         self.cfg = cfg = load_config(model_dir)
+        gguf = cfg.expert_layout == "gguf"
+        if gguf:                    # GGUF: every weight stays in the file's own quantization
+            dense_format = "native"
         if dense_format == "auto":  # stored 16-bit is exact and halves traffic, with the kernels
             dense_format = "f16" if kernels.ENABLED else "f32"
-        if dense_format not in ("f32", "f16", "int8"):
+        if dense_format not in ("f32", "f16", "int8", "native"):
             raise ValueError("dense_format must be auto, f32, f16 or int8")
         self.dense_format = dense_format
-        st = self.st = SafeTensorDir(model_dir)
+        if gguf:
+            from .gguf import GGUFNames
+            st = self.st = GGUFNames(model_dir)
+        else:
+            st = self.st = SafeTensorDir(model_dir)
 
         def big(name):
             """A large dense matrix in the chosen format."""
+            if gguf:
+                return st.matrix(name)
             if dense_format == "f16":
                 buf, tag, shape = st.raw(name)
                 if tag in ("F16", "BF16"):
@@ -348,7 +357,11 @@ class MoEModel:
         def opt(name):
             return st.get(name) if name in st else None
 
-        self.embed = st.get("model.embed_tokens.weight", dtype=None)  # only rows are read: keep as stored
+        if gguf:
+            from .gguf import Embedding
+            self.embed = Embedding(st.tensor("model.embed_tokens.weight"))   # rows decoded on lookup
+        else:
+            self.embed = st.get("model.embed_tokens.weight", dtype=None)  # only rows are read: keep as stored
         self.norm = st.get("model.norm.weight")
         self.lm_head = big("model.embed_tokens.weight"
                            if cfg.tie_word_embeddings or "lm_head.weight" not in st else "lm_head.weight")
@@ -360,7 +373,7 @@ class MoEModel:
                 m = _yarn_mscale(float(rs["factor"]), rs["mscale_all_dim"])
                 self.softmax_scale *= m * m
         else:
-            self.rotary = Rotary(cfg.head_dim, cfg.rope_theta)
+            self.rotary = Rotary(cfg.head_dim, cfg.rope_theta, interleaved=cfg.rope_interleaved)
         self.layers = []
         for i in range(cfg.num_layers):
             p = f"model.layers.{i}"
@@ -396,14 +409,14 @@ class MoEModel:
                 L["router_bias"] = opt(cfg.router_bias_name(i))
                 sg, su, sd, sgate = cfg.shared_expert_names(i)
                 if sg in st:
-                    L["shared"] = (st.get(sg), st.get(su), st.get(sd))
+                    L["shared"] = (big(sg), big(su), big(sd))
                     L["shared_gate"] = opt(sgate)
             else:
-                L["mlp"] = tuple(st.get(n) for n in cfg.dense_mlp_names(i))
+                L["mlp"] = tuple(big(n) for n in cfg.dense_mlp_names(i))
             self.layers.append(L)
         if backend is None:
             fmt = expert_format or default_format(cfg)
-            store = ExpertStore([CheckpointSource(model_dir, cfg)], fmt=fmt, lru_size=lru_size,
+            store = ExpertStore([open_source(model_dir, cfg)], fmt=fmt, lru_size=lru_size,
                                 gs=cfg.expert_gs or 64)
             if pin_budget > 0:  # keep the hottest experts resident, stream the rest
                 n = pin_budget // resident_bytes(cfg, fmt)

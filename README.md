@@ -84,7 +84,8 @@ that already fits.
   below), and `moelan monitor` for watching workers without loading a model.
 * **Safe wire format.** JSON header + raw numpy bytes; no pickle.
 
-Supported checkpoints (HF safetensors, F32/F16/BF16): **Mixtral**,
+Supported checkpoints (HF safetensors, F32/F16/BF16, and GGUF files - see
+below): **Mixtral**,
 **Qwen2-MoE**, **Qwen3-MoE** (Qwen3-30B-A3B, Qwen3-Coder-30B-A3B, ...),
 **OLMoE**, **DeepSeek V2 / V2-Lite / V2.5** and **DeepSeek V3 / R1 layouts**
 (`DeepseekV3ForCausalLM`, which Kimi K2 also uses), plus colibri int4
@@ -102,8 +103,42 @@ coordinator as part of the dense model), the dense first layers
 
 Not yet: the official FP8 DeepSeek-V3 / Kimi K2 releases (use a BF16
 conversion), V3's multi-token-prediction layer (ignored), GLM, Qwen3-Next,
-Llama 4, gpt-oss, quantized GGUF/GPTQ/AWQ checkpoints, and YaRN for
+Llama 4, gpt-oss, GPTQ/AWQ checkpoints, DeepSeek GGUF files, and YaRN for
 non-DeepSeek families.
+
+### GGUF files (llama.cpp, Ollama, LM Studio)
+
+`--model` also takes a `.gguf` file:
+
+```bash
+python -m moelan serve --model ~/models/Qwen3-30B-A3B-Q4_K_M.gguf
+```
+
+* **Architectures:** `qwen3moe`, `qwen2moe`, and `llama` with experts
+  (Mixtral). DeepSeek GGUFs are not supported yet.
+* **Quantizations:** F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q3_K,
+  Q4_K, Q5_K, Q6_K (so Q4_K_M, Q5_K_M, Q6_K, Q8_0 ... files). IQ formats are
+  not supported yet and are named in the error.
+* **Weights stay as stored.** Experts and attention weights are multiplied
+  straight from the GGUF blocks (compiled kernels: fused ones for Q8_0, Q4_K,
+  Q5_K, Q6_K when generating, decode-once-per-row otherwise, BLAS for long
+  prompts); a layer's stacked experts are sliced per expert without copying,
+  and workers receive and cache each expert's raw blocks. One Q4_K_M expert
+  of Qwen3-30B's shape takes 0.34 ms here, against 0.30 ms for colibri int4.
+* **Tokenizer and chat template from the file:** byte-level BPE (Qwen,
+  DeepSeek) or SentencePiece (llama / Mixtral, including files whose scores
+  were written as placeholders), special tokens kept whole. `--tokenizer
+  path/tokenizer.json` overrides it.
+* **llama-architecture files** store query / key rows reordered for llama.cpp's
+  interleaved rotary layout; moelan applies interleaved rotary instead.
+
+Checked against ground truth: every block decoder matches llama.cpp's
+`gguf-py` bit for bit; the real `ggml-org/stories15M_MOE` files give the same
+logits (F16) or the same 30 generated tokens (Q8_0) as its safetensors
+release, and its rebuilt tokenizer matches `tokenizer.json` exactly; a
+Qwen3-MoE GGUF with Q4_K/Q5_K/Q6_K experts written with `gguf-py` matches its
+safetensors twin, also across workers. Without numba, `pip install gguf` lets
+moelan decode the blocks in numpy (slow).
 
 ## 3. Quick start
 
@@ -462,7 +497,7 @@ checkpoints (they agree to about 1e-5).
 * Optional faster kernels (int4, numba/torch when present) on workers.
 * Run DeepSeek-V2-Lite (16B, BF16) end to end on real weights; FP8 block
   dequantization for the official DeepSeek-V3 / Kimi K2 files.
-* GLM / Qwen3-Next / gpt-oss adapters; GGUF input.
+* GLM / Qwen3-Next / gpt-oss adapters; DeepSeek and IQ-quant GGUF files.
 * Authentication (shared secret) and TLS for untrusted networks.
 
 ## License

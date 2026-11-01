@@ -16,3 +16,6 @@ graphify-out/
 # models and weights live outside the repository
 *.safetensors
 *.gguf
+
+# test models downloaded by hand (tests skip without them)
+tests/data/

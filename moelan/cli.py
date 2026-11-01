@@ -22,7 +22,11 @@ def _add_gpu_args(p: argparse.ArgumentParser) -> None:
 
 
 def _add_cluster_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--model", required=True, help="HF checkpoint directory (safetensors)")
+    p.add_argument("--model", required=True,
+                   help="HF checkpoint directory (safetensors), colibri container, or a .gguf file")
+    p.add_argument("--tokenizer", default=None,
+                   help="tokenizer.json to use instead of the model's own (e.g. for a GGUF whose "
+                        "vocabulary type moelan cannot rebuild)")
     _add_gpu_args(p)
     p.add_argument("--workers", default="", help="comma-separated host:port list")
     p.add_argument("--discover", type=float, default=0.0, metavar="SECONDS",
@@ -116,9 +120,9 @@ def cmd_discover(args) -> None:
 
 def cmd_inspect(args) -> None:
     from .config import load_config
-    from .experts import CheckpointSource, resident_bytes
+    from .experts import open_source, resident_bytes
     cfg = load_config(args.model)
-    src = CheckpointSource(args.model, cfg)
+    src = open_source(args.model, cfg)
     layers = cfg.moe_layers()
     disk = src.nbytes((layers[0], 0)) if layers else 0
     n = len(layers) * cfg.num_experts
@@ -126,7 +130,11 @@ def cmd_inspect(args) -> None:
     print(f"layers            {cfg.num_layers} ({len(layers)} MoE)")
     print(f"experts           {cfg.num_experts} per layer, top-{cfg.top_k}, {n} routed in total")
     print(f"one expert        {disk / 2**20:.2f} MiB on disk")
-    fmts = ("f32", "int8", "int4") if cfg.expert_layout == "colibri_int4" else ("f32", "int8")
+    if cfg.expert_layout == "gguf":
+        types = cfg.raw["moelan_gguf"]["expert_types"]
+        print(f"GGUF experts      gate {types.get('ffn_gate_exps')}, up {types.get('ffn_up_exps')}, "
+              f"down {types.get('ffn_down_exps')} - kept as stored, memory-mapped")
+    fmts = ("native",) if cfg.expert_layout == "gguf" else         ("f32", "int8", "int4") if cfg.expert_layout == "colibri_int4" else ("f32", "int8")
     for f in fmts:
         r = resident_bytes(cfg, f)
         print(f"  as {f:<5}         {r / 2**20:6.2f} MiB each, all experts {n * r / 2**30:7.2f} GiB, "
@@ -162,7 +170,7 @@ def cmd_run(args) -> None:
     from .model import save_heat
     from .tokenizer import Tokenizer
     model = build_model(args)
-    tok = Tokenizer(args.model)
+    tok = Tokenizer(args.model, args.tokenizer)
     text = tok.chat_prompt([{"role": "user", "content": args.prompt}]) if args.chat else args.prompt
     ids = tok.encode(text)
     if model.cfg.bos_token_id is not None and not args.chat and args.bos:
@@ -202,7 +210,7 @@ def cmd_serve(args) -> None:
     from .tokenizer import Tokenizer
     from .worker import parse_size
     model = build_model(args)
-    serve_http(model, Tokenizer(args.model), Path(args.model).name, args.host, args.port,
+    serve_http(model, Tokenizer(args.model, args.tokenizer), Path(args.model).name, args.host, args.port,
                max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens,
                prompt_cache_dir=args.prompt_cache_dir,
                prompt_cache_disk=parse_size(args.prompt_cache_disk, 0))

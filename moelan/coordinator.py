@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from .config import ModelConfig, model_fingerprint
-from .experts import CheckpointSource, ExpertStore, bench_expert, default_format, resident_bytes
+from .experts import ExpertStore, bench_expert, default_format, open_source, resident_bytes
 from .model import ExpertBackend, group_by_expert
 from .planner import LOCAL, Plan, make_plan, node_ms, speed_shares
 from .protocol import (PROTOCOL_VERSION, WIRE_FORMATS, decode_rows, encode_rows, recv_msg, send_msg,
@@ -144,7 +144,7 @@ class DistributedBackend(ExpertBackend):
         self.wire = wire
         self.fmt = fmt = fmt or default_format(cfg)
         self.fingerprint = model_fingerprint(model_dir)
-        self.source = CheckpointSource(model_dir, cfg)
+        self.source = open_source(model_dir, cfg)
         self.local = ExpertStore([self.source], fmt=fmt, lru_size=lru_size, gs=cfg.expert_gs or 64)
         meta = Path(model_dir) / "qwen36_meta.json"
         self.meta = json.loads(meta.read_text()) if meta.exists() else None
@@ -184,15 +184,19 @@ class DistributedBackend(ExpertBackend):
         """Benchmark this machine and every worker, measure round trips, and
         return the shares of the routed work that balance a layer's time."""
         cfg = self.cfg
-        dims = {"hidden": cfg.hidden_size, "inter": cfg.moe_intermediate_size, "format": self.fmt,
+        fmt = self.fmt
+        if cfg.expert_layout == "gguf":      # time the file's own block types
+            types = cfg.raw["moelan_gguf"]["expert_types"]
+            fmt = "gguf:" + ",".join(types[p] for p in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"))
+        dims = {"hidden": cfg.hidden_size, "inter": cfg.moe_intermediate_size, "format": fmt,
                 "gs": cfg.expert_gs or 64}
-        local_ms = bench_expert(dims["hidden"], dims["inter"], self.fmt, dims["gs"])
+        local_ms = bench_expert(dims["hidden"], dims["inter"], fmt, dims["gs"])
         local_gpu = {}
         if self.gpu_spec:   # this machine's GPU counts too
             from .accel import bench_gpu
             try:
                 local_gpu = bench_gpu(self.gpu_spec, self.gpu_budget, dims["hidden"], dims["inter"],
-                                      self.fmt, dims["gs"])
+                                      fmt, dims["gs"])
             except RuntimeError as exc:
                 self.progress(f"this machine's GPU: {exc}")
         total = self.expert_ram * len(cfg.moe_layers()) * cfg.num_experts

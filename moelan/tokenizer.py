@@ -26,9 +26,9 @@ class ByteTokenizer:
 
 
 class HFTokenizer:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path | None = None, tok=None):
         from tokenizers import Tokenizer
-        self.tok = Tokenizer.from_file(str(path))
+        self.tok = tok if tok is not None else Tokenizer.from_file(str(path))
 
     def encode(self, text: str) -> list[int]:
         return self.tok.encode(text, add_special_tokens=False).ids
@@ -38,9 +38,26 @@ class HFTokenizer:
 
 
 class Tokenizer:
-    def __init__(self, model_dir: str | Path):
+    def __init__(self, model_dir: str | Path, tokenizer_json: str | Path | None = None):
+        from .gguf import is_gguf
+        if is_gguf(model_dir):        # vocabulary, special tokens and chat template from the file
+            from .gguf import build_tokenizer, chat_template, open_gguf
+            try:
+                self.impl = HFTokenizer(tokenizer_json) if tokenizer_json else HFTokenizer(tok=build_tokenizer(model_dir))
+            except ImportError as exc:
+                raise SystemExit("GGUF models need the 'tokenizers' package: pip install tokenizers") from exc
+            meta = open_gguf(model_dir).meta
+            tokens = meta.get("tokenizer.ggml.tokens") or []
+
+            def name(key):
+                i = meta.get(key)
+                return tokens[i] if i is not None and i < len(tokens) else ""
+            self.config = {"bos_token": name("tokenizer.ggml.bos_token_id"),
+                           "eos_token": name("tokenizer.ggml.eos_token_id")}
+            self.template = chat_template(model_dir)
+            return
         root = Path(model_dir)
-        tj = root / "tokenizer.json"
+        tj = Path(tokenizer_json) if tokenizer_json else root / "tokenizer.json"
         if tj.exists():
             try:
                 self.impl = HFTokenizer(tj)

@@ -43,7 +43,7 @@ class ModelConfig:
     max_position_embeddings: int = 4096
     bos_token_id: int | None = None
     eos_token_ids: list[int] = field(default_factory=list)
-    expert_layout: str = "hf"           # "hf" or "colibri_int4"
+    expert_layout: str = "hf"           # "hf", "colibri_int4" or "gguf"
     expert_gs: int = 0                  # int4 scale group size (colibri)
     # routing (defaults = plain softmax top-k)
     scoring_func: str = "softmax"       # "softmax" or "sigmoid"
@@ -59,6 +59,7 @@ class ModelConfig:
     qk_rope_head_dim: int = 0
     v_head_dim: int = 0
     rope_scaling: dict | None = None
+    rope_interleaved: bool = False      # rotary pairs stored side by side (GGUF llama, DeepSeek MLA)
     raw: dict = field(default_factory=dict, repr=False)
 
     # ---- tensor names -------------------------------------------------
@@ -122,7 +123,10 @@ _FAMILIES = {
 
 
 def load_config(model_dir: str | Path) -> ModelConfig:
-    raw = json.loads((Path(model_dir) / "config.json").read_text())
+    """Config of a checkpoint directory (``config.json``) or a GGUF file."""
+    from .gguf import config_dict, is_gguf
+    gguf_file = is_gguf(model_dir)
+    raw = config_dict(model_dir) if gguf_file else json.loads((Path(model_dir) / "config.json").read_text())
     arch = (raw.get("architectures") or ["?"])[0]
     family = _FAMILIES.get(arch)
     if family is None:
@@ -170,7 +174,9 @@ def load_config(model_dir: str | Path) -> ModelConfig:
 
     layout, gs = "hf", 0
     meta = Path(model_dir) / "qwen36_meta.json"
-    if meta.exists():  # colibri container: experts packed int4, group-scaled
+    if raw.get("moelan_gguf"):        # a GGUF file, or a worker cache made from one
+        layout = "gguf"
+    elif not gguf_file and meta.exists():  # colibri container: experts packed int4, group-scaled
         m = json.loads(meta.read_text())
         if m.get("ebits") != 4:
             raise ValueError(f"colibri container with ebits={m.get('ebits')} is not supported yet (int4 only)")
@@ -179,7 +185,7 @@ def load_config(model_dir: str | Path) -> ModelConfig:
             raise ValueError("colibri container without group scales (expert_gs) is not supported yet")
     gen = Path(model_dir) / "generation_config.json"
     eos = raw.get("eos_token_id")
-    if gen.exists():
+    if not gguf_file and gen.exists():
         eos = json.loads(gen.read_text()).get("eos_token_id", eos)
     eos_ids = eos if isinstance(eos, list) else ([eos] if eos is not None else [])
     cfg = ModelConfig(
@@ -206,6 +212,7 @@ def load_config(model_dir: str | Path) -> ModelConfig:
         eos_token_ids=eos_ids,
         expert_layout=layout,
         expert_gs=gs,
+        rope_interleaved=bool((raw.get("moelan_gguf") or {}).get("rope_interleaved")),
         raw=raw,
     )
     for k, v in extra.items():
@@ -218,6 +225,9 @@ def load_config(model_dir: str | Path) -> ModelConfig:
 
 def model_fingerprint(model_dir: str | Path) -> str:
     """Stable id of a checkpoint: config + tensor layout. Workers key caches by it."""
+    from .gguf import is_gguf, open_gguf
+    if is_gguf(model_dir):
+        return open_gguf(model_dir).fingerprint()
     root = Path(model_dir)
     h = hashlib.sha256((root / "config.json").read_bytes())
     index = root / "model.safetensors.index.json"

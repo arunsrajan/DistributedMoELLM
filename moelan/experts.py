@@ -36,7 +36,7 @@ from .config import ModelConfig
 from .safetensors_io import SafeTensorDir, SafeTensorFile, decode_tensor, save_file
 
 ExpertKey = tuple[int, int]  # (layer, expert)
-FORMATS = ("f32", "int8", "int4")
+FORMATS = ("f32", "int8", "int4", "native")   # native: as stored in the file (GGUF), not converted
 
 ROWS = 64  # rows dequantized per step: the f32 scratch (64 x 2048 x 4 = 512 KiB) stays in L2
 
@@ -261,13 +261,21 @@ class Expert:
         return self.gu.nbytes + self.down.nbytes
 
 
+def _mt(x: np.ndarray, w) -> np.ndarray:
+    return x @ w.T if isinstance(w, np.ndarray) else w.matmul_t(x)
+
+
 def expert_ffn(x: np.ndarray, gate, up, down) -> np.ndarray:
-    """SwiGLU with plain f32 matrices (dense MLP layers, shared experts)."""
-    return (silu(x @ gate.T) * (x @ up.T)) @ down.T
+    """SwiGLU with separate matrices (dense MLP layers, shared experts); each
+    may be a plain f32 array or a quantized matrix (GGUF)."""
+    return _mt(silu(_mt(x, gate)) * _mt(x, up), down)
 
 
 def to_format(e: Expert, fmt: str, gs: int = 64) -> Expert:
     """Convert an expert to a resident format."""
+    if fmt == "native":         # keep the file's own encoding (memory-mapped, no copy)
+        return e
+
     def conv(m):
         if fmt == "f32":
             return m if isinstance(m, F32Matrix) else F32Matrix(m.dequant())
@@ -291,17 +299,31 @@ def to_format(e: Expert, fmt: str, gs: int = 64) -> Expert:
     return Expert(conv(e.gu), conv(e.down), e.inter)
 
 
+def open_source(model_dir, cfg: ModelConfig):
+    """Where a node reads experts from its own copy of the model."""
+    if cfg.expert_layout == "gguf":
+        from .gguf import GGUFSource
+        return GGUFSource(model_dir, cfg)
+    return CheckpointSource(model_dir, cfg)
+
+
 def default_format(cfg: ModelConfig) -> str:
     """For int4 checkpoints: int4 as stored when the compiled kernels are there
     (memory-mapped, no copy), else int8 (numpy is ~3x faster on it). f32 otherwise."""
     if cfg.expert_layout == "colibri_int4":
         return "int4" if kernels.ENABLED else "int8"
+    if cfg.expert_layout == "gguf":
+        return "native"
     return "f32"
 
 
 def synthetic_expert(hidden: int, inter: int, fmt: str, gs: int = 64, rng=None) -> Expert:
-    """A random expert of the given shape and resident format (for benchmarks)."""
+    """A random expert of the given shape and resident format (for benchmarks);
+    ``gguf:Q4_K,Q4_K,Q6_K`` gives one in those GGUF types (gate, up, down)."""
     rng = rng or np.random.default_rng(0)
+    if fmt.startswith("gguf:"):
+        from .gguf import synthetic_expert as gguf_expert
+        return gguf_expert(hidden, inter, fmt[5:].split(","), rng)
     gs = gs if hidden % gs == 0 and inter % gs == 0 else hidden
 
     def mat(o, i):
@@ -323,7 +345,7 @@ def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48
     cache, as they do when generating."""
     import time
     rng = np.random.default_rng(0)
-    one = 3 * hidden * inter * {"int4": 0.5, "int8": 1, "f32": 4}.get(fmt, 4)
+    one = 3 * hidden * inter * {"int4": 0.5, "int8": 1, "f32": 4}.get(fmt, 0.6 if fmt.startswith("gguf:") else 4)
     experts = [synthetic_expert(hidden, inter, fmt, gs, rng)
                for _ in range(max(2, min(12, int(48 * 2**20 // one) + 1)))]
     x = (rng.standard_normal((1, hidden)) * 0.1).astype(np.float32)
@@ -340,6 +362,8 @@ def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48
 
 def resident_bytes(cfg: ModelConfig, fmt: str) -> int:
     """RAM one routed expert takes in ``fmt``."""
+    if fmt == "native" and cfg.expert_layout == "gguf":
+        return int(cfg.raw["moelan_gguf"]["expert_bytes"])
     n = 3 * cfg.hidden_size * cfg.moe_intermediate_size
     gs = cfg.expert_gs or 64
     if fmt == "f32":
@@ -431,16 +455,28 @@ class CacheSource:
         return sorted(out)
 
     def put(self, key: ExpertKey, raw: dict[str, tuple[bytes, str, list[int]]]) -> None:
-        # Keep the original dtype on disk.
-        arrays, bf16 = {}, set()
+        # Keep the original dtype on disk; GGUF blocks as raw bytes, their type
+        # in the file's metadata.
+        arrays, bf16, meta = {}, set(), {}
         for part, (buf, tag, shape) in raw.items():
+            if tag.startswith("GGUF:"):
+                arrays[part] = np.frombuffer(buf, np.uint8).reshape(shape)
+                meta[part] = tag
+                continue
             if tag == "BF16":
                 bf16.add(part)
             arrays[part] = decode_tensor(buf, tag, shape, dtype=None)
-        save_file(arrays, self._path(key), bf16=bf16)
+        save_file(arrays, self._path(key), metadata=meta or None, bf16=bf16)
 
     def load(self, key: ExpertKey) -> Expert:
         f = SafeTensorFile(self._path(key))  # memory-mapped, like the checkpoint
+        if self.cfg.expert_layout == "gguf":
+            from .gguf import expert_from_parts
+            parts = {}
+            for part in ("gate", "up", "down"):
+                buf, _, shape = f.raw(part)
+                parts[part] = (np.asarray(buf).reshape(shape), f.metadata[part][5:])
+            return expert_from_parts(self.cfg, parts)
 
         def get(part):
             buf, tag, shape = f.raw(part)

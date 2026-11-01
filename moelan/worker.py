@@ -23,7 +23,7 @@ import numpy as np
 from . import __version__
 from .config import load_config, model_fingerprint
 from .discovery import Beacon, local_ip
-from .experts import CacheSource, CheckpointSource, ExpertStore
+from .experts import CacheSource, ExpertStore, open_source
 from .protocol import PROTOCOL_VERSION, decode_rows, encode_rows, recv_msg, send_msg, tune_socket
 
 log = logging.getLogger("moelan.worker")
@@ -107,7 +107,7 @@ class WorkerState:
             cfg = load_config(d)
             sources = [CacheSource(d, cfg)]
             if self.local_fp == fp:
-                sources.insert(0, CheckpointSource(self.model_dir, load_config(self.model_dir)))
+                sources.insert(0, open_source(self.model_dir, load_config(self.model_dir)))
             st = self.stores[fp] = ExpertStore(sources, fmt=fmt, lru_size=self.lru_size,
                                                threads=self.threads, gs=cfg.expert_gs or 64)
             return st
