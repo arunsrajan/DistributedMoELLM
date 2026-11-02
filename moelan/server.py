@@ -511,7 +511,7 @@ def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
 def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: str = "127.0.0.1",
                port: int = 8000, monitor: WorkerMonitor | None = None, max_batch: int = 4,
                prompt_cache_tokens: int = 16384, prompt_cache_dir=None, prompt_cache_disk: int = 0,
-               expert_tokens: bool = False):
+               expert_tokens: bool = False, traffic_file=None):
     httpd = make_server(model, tok, name, host, port, monitor, max_batch=max_batch,
                         prompt_cache_tokens=prompt_cache_tokens, prompt_cache_dir=prompt_cache_dir,
                         prompt_cache_disk=prompt_cache_disk, expert_tokens=expert_tokens)
@@ -519,9 +519,16 @@ def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: s
     print(f"dashboard:  http://{shown}:{port}/")
     if model is not None:
         print(f"OpenAI API: http://{shown}:{port}/v1")
+    recorder = None
+    if model is not None and traffic_file is not None:
+        from .heatfiles import TrafficRecorder
+        recorder = TrafficRecorder(model.backend, model.cfg, traffic_file)
+        recorder.start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if recorder is not None:
+            recorder.stop()
         httpd.server_close()

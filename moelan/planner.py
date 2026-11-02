@@ -19,6 +19,10 @@ experts were picked), and on the coordinator ``picks * expert_ms`` (it
 computes its own experts while waiting). :func:`speed_shares` picks the
 shares with the lowest expected layer time; a worker that cannot make a layer
 clearly faster gets no experts at all.
+
+GPUs hold few experts, so which ones matters: the nodes in ``fast`` take each
+layer's hottest experts first, then the rest are split by count, which stays
+fair when the routing counts turn out not to match the traffic.
 """
 
 from __future__ import annotations
@@ -124,12 +128,16 @@ def speed_shares(top_k: int, local_ms: float, workers: dict[str, tuple[float, fl
 
 def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
               nodes: dict[str, int], heat: dict[ExpertKey, float] | None = None,
-              replicate: bool = True, shares: dict[str, float] | None = None) -> Plan:
+              replicate: bool = True, shares: dict[str, float] | None = None,
+              fast: list[tuple[str, int, float]] | None = None) -> Plan:
     """Place ``layers x num_experts`` experts of ``expert_bytes`` each on ``nodes``
     (node id -> RAM budget in bytes). With ``shares`` (node id -> fraction of
     the routed work, e.g. from :func:`speed_shares`) each layer's routing heat
     is split in those proportions instead of by RAM; nodes with a zero share get
-    nothing."""
+    nothing. ``fast`` lists (node id, experts its GPU holds, ms per expert on it):
+    with ``heat`` and ``shares``, each layer's hottest experts go to those GPUs,
+    each to whichever would finish its picks first, until the GPUs are full or
+    carry the share of the picks their nodes were given (more would only queue)."""
     heat = heat or {}
     pool = {nid: Node(nid, b) for nid, b in nodes.items() if b > 0}
     if shares is not None:
@@ -150,7 +158,30 @@ def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
         return heat.get(key, 0.0) + 0.05 * mean_heat + (1.0 if not heat else 0.0)
     layer_mean = {l: sum(weight((l, e)) for e in range(num_experts)) / num_experts for l in layers}
 
+    gpus = [f for f in (fast or []) if f[0] in pool and f[1] >= len(layers)] if heat and shares is not None else []
+    if gpus:
+        limit = sum(shares[nid] for nid, _, _ in gpus)
+        for layer in layers:
+            keys = [k for k in order if k[0] == layer]
+            total = sum(heat.get(k, 0.0) for k in keys)
+            carried = {nid: 0.0 for nid, _, _ in gpus}
+            held = {nid: 0 for nid, _, _ in gpus}
+            for key in keys:
+                pick = heat.get(key, 0.0) / total if total > 0 else 0.0
+                room = [g for g in gpus if held[g[0]] < g[1] // len(layers) and pool[g[0]].free >= expert_bytes]
+                if total <= 0 or not room or sum(carried.values()) >= limit:
+                    break
+                nid = min(room, key=lambda g: (carried[g[0]] + pick) * g[2])[0]
+                carried[nid] += pick
+                held[nid] += 1
+                pool[nid].used_bytes += expert_bytes
+                pool[nid].experts.append(key)
+                owners[key] = [nid]
+                per_layer_count[(layer, nid)] = held[nid]
+
     for key in order:
+        if key in owners:
+            continue
         layer = key[0]
         best, best_score = None, None
         for n in pool.values():
@@ -158,7 +189,7 @@ def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
                 continue
             # how far above its fair share of this layer the node would be with this expert
             share = (shares[n.node_id] if shares is not None else n.budget_bytes / total_budget) * num_experts
-            add = weight(key) / layer_mean[layer] if shares is not None else 0.0
+            add = (1.0 if gpus else weight(key) / layer_mean[layer]) if shares is not None else 0.0
             score = (per_layer_count.get((layer, n.node_id), 0) + add) / share
             if best is None or score < best_score - 1e-9 or (
                     abs(score - best_score) <= 1e-9 and n.free > best.free):
@@ -169,7 +200,7 @@ def make_plan(layers: list[int], num_experts: int, expert_bytes: int,
         best.used_bytes += expert_bytes
         best.experts.append(key)
         per_layer_count[(layer, best.node_id)] = per_layer_count.get((layer, best.node_id), 0) + (
-            weight(key) / layer_mean[layer] if shares is not None else 1)
+            weight(key) / layer_mean[layer] if shares is not None and not gpus else 1)
         owners[key] = [best.node_id]
 
     if replicate and len(pool) > 1 and not unplaced:

@@ -165,6 +165,7 @@ class DistributedBackend(ExpertBackend):
         self.expert_ram = resident_bytes(cfg, fmt)
         self.local_budget = local_budget
         self.speed: dict = {}
+        self.fast: list[tuple[str, int, float]] = []    # nodes with a useful GPU: experts it holds, ms each
         budgets = {nid: c.info["budget_bytes"] for nid, c in self.conns.items()}
         shares = None
         if placement == "speed" and self.conns:
@@ -175,7 +176,7 @@ class DistributedBackend(ExpertBackend):
         elif local_budget > 0:
             budgets[LOCAL] = local_budget
         self.plan: Plan = make_plan(cfg.moe_layers(), cfg.num_experts, self.expert_ram,
-                                    budgets, heat=heat, replicate=replicate, shares=shares)
+                                    budgets, heat=heat, replicate=replicate, shares=shares, fast=self.fast)
         self.progress("placement plan:\n" + self.plan.summary(self.expert_ram))
         self._setup_all()
 
@@ -248,6 +249,11 @@ class DistributedBackend(ExpertBackend):
         local_eff, workers = effective(shares)
         shares, layer_ms, _ = speed_shares(cfg.top_k, local_eff, workers)
         alone_ms = cfg.top_k * local_eff       # this machine on its own, with its GPU if any
+        self.fast = [(nid, g["gpu_experts"], g["gpu_ms"]) for nid, g in gpus.items()
+                     if workers[nid][0] < cpu_only[nid][0]]
+        if local_gpu and local_eff < local_ms:
+            self.fast.append((LOCAL, local_gpu["gpu_experts"], local_gpu["gpu_ms"]))
+        self.fast.sort(key=lambda f: f[2])
         same_host = self.speed.get("same_host", [])
         self.speed = {"local_ms": local_eff, "local_cpu_ms": local_ms, "local_gpu": local_gpu or None,
                       "layer_ms": layer_ms, "layer_ms_alone": alone_ms,

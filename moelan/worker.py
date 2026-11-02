@@ -176,8 +176,11 @@ class _Handler(socketserver.BaseRequestHandler):
         if op == "assign":
             store = st.store_for(h["fingerprint"], h.get("config"), h.get("meta"), h.get("format", "int8"))
             keys = [tuple(k) for k in h["experts"]]
+            heat = h.get("heat") or []
+            if (st.assigned.get(h["fingerprint"]), st.heat.get(h["fingerprint"])) != (keys, heat):
+                store.gpu = None     # a new plan: "load" chooses the GPU's experts again
             st.assigned[h["fingerprint"]] = keys
-            st.heat[h["fingerprint"]] = h.get("heat") or []
+            st.heat[h["fingerprint"]] = heat
             missing = [list(k) for k in keys if not store.can_serve(k)]
             return {"ok": True, "missing": missing}, None
         if op == "put":

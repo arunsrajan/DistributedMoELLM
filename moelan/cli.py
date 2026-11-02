@@ -50,8 +50,9 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
                         "finish a layer together, dropping workers that would only slow it down; "
                         "ram: split by RAM budget only")
     p.add_argument("--heat", default=None,
-                   help="routing statistics file: read to place hot experts first, updated after the run "
-                        "(default: the model's colibri .coli_usage, read only)")
+                   help="routing statistics file: read to place hot experts first, updated after a run. "
+                        "Default: what serve saved from real traffic, else what probe --topic measured, "
+                        "else the model's colibri .coli_usage")
     p.add_argument("--lru", type=int, default=64, help="experts kept in the coordinator's disk-stream LRU")
 
 
@@ -67,7 +68,8 @@ def build_model(args):
     from .config import load_config
     from .coordinator import DistributedBackend
     from .discovery import discover
-    from .model import MoEModel, load_heat
+    from .heatfiles import choose_heat
+    from .model import MoEModel
     from .worker import parse_size
 
     kernels.warn_if_slow()
@@ -79,8 +81,7 @@ def build_model(args):
             if addr not in workers:
                 workers.append(addr)
     cfg = load_config(args.model)
-    heat_file = args.heat or Path(args.model) / ".coli_usage"
-    heat = load_heat(heat_file)
+    heat = choose_heat(args.model, cfg, args.heat)
     budget = parse_size(args.local_budget, 0)
     if not workers:
         print("no workers: every expert runs on this machine "
@@ -206,6 +207,7 @@ def cmd_run(args) -> None:
 
 
 def cmd_serve(args) -> None:
+    from .heatfiles import traffic_path
     from .server import serve_http
     from .tokenizer import Tokenizer
     from .worker import parse_size
@@ -213,12 +215,41 @@ def cmd_serve(args) -> None:
     serve_http(model, Tokenizer(args.model, args.tokenizer), Path(args.model).name, args.host, args.port,
                max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens,
                prompt_cache_dir=args.prompt_cache_dir,
-               prompt_cache_disk=parse_size(args.prompt_cache_disk, 0), expert_tokens=args.expert_tokens)
+               prompt_cache_disk=parse_size(args.prompt_cache_disk, 0), expert_tokens=args.expert_tokens,
+               traffic_file=None if args.no_save_traffic else traffic_path(args.model))
     model.backend.close()
+
+
+def cmd_probe_topic(args) -> None:
+    from .heatfiles import load_topic_heat, run_topic_probe, topic_path
+    from .tokenizer import Tokenizer
+    path = Path(args.out) if args.out else topic_path(args.model)
+    per = args.passages or 4
+    done = load_topic_heat(path)
+    if done and done.get("complete") and done["topic"] == args.topic and not args.fresh:
+        print(f"already measured {args.topic!r}: {path} (--fresh measures it again)")
+        return
+    if args.fresh:
+        path.unlink(missing_ok=True)
+    model = build_model(args)
+    tok = Tokenizer(args.model, args.tokenizer)
+    print(f"{args.topic!r}: the model chooses {args.subtopics} sub-topics and writes {per} passages on each. "
+          "Ctrl+C keeps the finished passages; the same command continues.")
+    try:
+        result = run_topic_probe(model, tok, args.topic, path, subtopics=args.subtopics, per_subtopic=per,
+                                 passage_tokens=args.passage_tokens)
+    finally:
+        model.backend.close()
+    print(f"saved {len(result['passages'])} passages, {result['tokens']} tokens, to {path}. The next start uses "
+          "these experts until serve has saved enough real traffic.")
 
 
 def cmd_probe(args) -> None:
     import json
+    if args.topic:
+        if args.prompts:
+            sys.exit("give --topic or --prompts, not both")
+        return cmd_probe_topic(args)
     from .probe_passages import PASSAGES
     from .tokenizer import Tokenizer
     from .topics import has_signal, run_probe, save_topics, topics_path
@@ -335,6 +366,9 @@ def main(argv=None) -> None:
     p.add_argument("--expert-tokens", action="store_true",
                    help="count which tokens reach each expert, for the dashboard's tooltip. Fragments of "
                         "real prompts become visible to anyone who can open the dashboard")
+    p.add_argument("--no-save-traffic", action="store_true",
+                   help="do not save how often each expert is picked (counts only, no text), which the "
+                        "next start uses to place the most-picked experts on the fastest GPUs")
     p.set_defaults(fn=cmd_serve)
 
     p = sub.add_parser("probe", help="measure which topics experts lean to, for the dashboard")
@@ -342,8 +376,17 @@ def main(argv=None) -> None:
     p.add_argument("--prompts", default=None,
                    help='JSON file {"topic": ["passage", ...], ...} with at least 3 passages per topic '
                         "(default: 8 built-in topics, about 4,000 tokens)")
-    p.add_argument("--passages", type=int, default=None, help="use only this many passages per topic")
-    p.add_argument("--out", default=None, help="result file (default ~/.moelan/topics/<model id>.json)")
+    p.add_argument("--passages", type=int, default=None,
+                   help="use only this many passages per topic (with --topic: per sub-topic, default 4)")
+    p.add_argument("--out", default=None,
+                   help="result file (default ~/.moelan/topics/<model id>.json; with --topic "
+                        "~/.moelan/heat/<model id>.topic.json)")
+    p.add_argument("--topic", default=None,
+                   help="for placement, before any real traffic: the model chooses sub-topics of this topic "
+                        "and writes passages, and their most-picked experts go to the fastest GPUs at the next start")
+    p.add_argument("--subtopics", type=int, default=12, help="sub-topics to choose with --topic")
+    p.add_argument("--passage-tokens", type=int, default=140, help="length of each passage with --topic")
+    p.add_argument("--fresh", action="store_true", help="with --topic: start again, dropping an earlier result")
     p.set_defaults(fn=cmd_probe)
 
     p = sub.add_parser("monitor", help="dashboard of worker health, without loading a model")

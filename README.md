@@ -357,6 +357,61 @@ and a fast link; for an equally fast machine 0.3 ms away the planner gives it
 about 40% of the routed work and expects a layer about 30% faster (not yet
 measured on two real machines).
 
+### Most-picked experts on the GPUs
+
+A GPU holds only part of the experts, so it matters which. Placement counts how
+often each expert is picked and uses the best counts it has:
+
+1. **`--heat <file>`**, if given.
+2. **Real traffic.** `serve` saves the counts every minute and on exit, to
+   `~/.moelan/heat/<model id>.traffic.json`, and the next start uses them once
+   they cover 200 tokens. Only counts per expert are stored, never prompt text;
+   older traffic counts half after 20,000 new tokens. `--no-save-traffic` turns
+   this off.
+3. **A topic probe**, for the first start, before there is any traffic:
+
+   ```bash
+   python -m moelan probe --model <model> --topic "software development life cycle"
+   ```
+
+   The model chooses 12 sub-topics (`--subtopics`) and writes 4 passages of 140
+   tokens on each (`--passages`, `--passage-tokens`): an explanation, a code
+   example, a how-to and a conversation, since experts answer to the form of the
+   text as much as to its subject. The experts picked while writing are counted
+   and saved after every passage, so Ctrl+C and the same command continue.
+4. The model's colibri `.coli_usage`.
+
+Each layer's hottest experts go to the nodes with a useful GPU, each to the GPU
+that would finish its picks first, until the GPUs are full or carry the share
+of the picks the speed measurement gave their nodes. The remaining experts are
+split by count, which stays fair when the counts turn out not to match the
+traffic. A worker that stays running chooses its GPU's experts again when the
+plan changes.
+
+Simulated by replaying recorded picks of Qwen3-Coder-30B (other work assumed to
+take 201 ms per token, a coordinator at 0.31 ms per expert, two GPU workers at
+0.05 and 0.10 ms and a 0.4 ms round trip; not yet measured on real GPUs), on
+text not used to choose the experts, with each GPU holding 32 experts per layer:
+
+| Counts from | Code and tool calls: before | now | Docs: before | now |
+|---|---|---|---|---|
+| none | 3.67 tok/s | 3.67 tok/s | 3.66 tok/s | 3.66 tok/s |
+| topic probe | 3.71 tok/s | 3.84 tok/s | 3.95 tok/s | 4.08 tok/s |
+| real traffic | 3.99 tok/s | 4.16 tok/s | 4.01 tok/s | 4.16 tok/s |
+
+Over 96 such cases (1 to 3 GPUs of different speeds, 4 to 64 experts per layer)
+expert time falls 6% on average; the worst case, a slow GPU with plenty of room,
+is 8% slower. Sending only the hottest experts to the fastest GPU without limit
+was slower than balancing, because its picks then queue. A probe's topic also
+says little about code: choosing experts from text about software covered 24% of
+real code's picks with 32 experts per layer, about the same as from unrelated
+topics, while half of the real text covered the other half at 63%. Prefer real
+traffic when there is any.
+
+Counting while writing gives the same experts as reading the finished passages
+again (94-95% overlap, same coverage on other text), so no second pass is needed.
+A probe of 48 passages takes about an hour at the 1.7 tok/s this laptop reached.
+
 ### Compressing the network traffic (`--wire`)
 
 Per token and MoE layer each worker gets the token's hidden state (2048
@@ -519,6 +574,7 @@ been measured here, as this machine has none.
 | `moelan/experts.py` | expert store and formats (f32 / int8 / colibri int4), memory-mapped streaming |
 | `moelan/kernels.py` | optional numba kernels for group-scaled int4/int8/f32 mat-vec |
 | `moelan/planner.py` | expert placement and replication |
+| `moelan/heatfiles.py` | routing counts for placement: real traffic and topic probes |
 | `moelan/protocol.py` | framed JSON + array wire protocol |
 | `moelan/worker.py` | expert worker server |
 | `moelan/coordinator.py` | distributed backend: setup, transfer, per-layer fan-out, failover |
