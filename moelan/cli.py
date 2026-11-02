@@ -213,8 +213,35 @@ def cmd_serve(args) -> None:
     serve_http(model, Tokenizer(args.model, args.tokenizer), Path(args.model).name, args.host, args.port,
                max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens,
                prompt_cache_dir=args.prompt_cache_dir,
-               prompt_cache_disk=parse_size(args.prompt_cache_disk, 0))
+               prompt_cache_disk=parse_size(args.prompt_cache_disk, 0), expert_tokens=args.expert_tokens)
     model.backend.close()
+
+
+def cmd_probe(args) -> None:
+    import json
+    from .probe_passages import PASSAGES
+    from .tokenizer import Tokenizer
+    from .topics import has_signal, run_probe, save_topics, topics_path
+    passages = json.loads(Path(args.prompts).read_text(encoding="utf-8")) if args.prompts else PASSAGES
+    passages = {name: texts[:args.passages] for name, texts in passages.items()}
+    if len(passages) < 2:
+        sys.exit("a probe compares topics: give at least two")
+    model = build_model(args)
+    tok = Tokenizer(args.model, args.tokenizer)
+    n = sum(len(v) for v in passages.values())
+    print(f"reading {n} passages from {len(passages)} topics (Ctrl+C stops without saving)")
+    try:
+        result = run_probe(model, tok, passages)
+    finally:
+        model.backend.close()
+    path = Path(args.out) if args.out else topics_path(args.model)
+    save_topics(result, path)
+    print(f"\nexperts leaning to each topic, of {result['tested']} tested:")
+    for t in result["topics"]:
+        best = f"strongest L{t['best']['layer']}.E{t['best']['expert']} x{t['best']['lift']:g}" if t["best"] else ""
+        note = "" if has_signal(t) else "  (no clear signal)"
+        print(f"  {t['name']:<12} {t['experts']:>5}  (about {t['chance']:g} by chance)  {best}{note}")
+    print(f"saved to {path}; a running server picks it up by itself")
 
 
 def cmd_monitor(args) -> None:
@@ -305,7 +332,19 @@ def main(argv=None) -> None:
                    help="where long prompt caches are kept across restarts (default ~/.moelan/kvcache)")
     p.add_argument("--prompt-cache-disk", default="8G",
                    help="disk space for them, e.g. 20G (0 = memory only)")
+    p.add_argument("--expert-tokens", action="store_true",
+                   help="count which tokens reach each expert, for the dashboard's tooltip. Fragments of "
+                        "real prompts become visible to anyone who can open the dashboard")
     p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("probe", help="measure which topics experts lean to, for the dashboard")
+    _add_cluster_args(p)
+    p.add_argument("--prompts", default=None,
+                   help='JSON file {"topic": ["passage", ...], ...} with at least 3 passages per topic '
+                        "(default: 8 built-in topics, about 4,000 tokens)")
+    p.add_argument("--passages", type=int, default=None, help="use only this many passages per topic")
+    p.add_argument("--out", default=None, help="result file (default ~/.moelan/topics/<model id>.json)")
+    p.set_defaults(fn=cmd_probe)
 
     p = sub.add_parser("monitor", help="dashboard of worker health, without loading a model")
     p.add_argument("--workers", default="", help="comma-separated host:port list")

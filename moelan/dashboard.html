@@ -75,7 +75,18 @@ tr:last-child td { border-bottom: none; }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin-top: 10px; }
 .map-wrap { position: relative; }
 .tip { position: absolute; pointer-events: none; background: var(--text); color: var(--bg);
-  font-size: 12px; padding: 5px 8px; border-radius: 6px; white-space: nowrap; display: none; z-index: 2; }
+  font-size: 12px; line-height: 1.5; padding: 5px 8px; border-radius: 6px; white-space: pre; display: none; z-index: 2; }
+#topics { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; font-size: 13px; }
+#topics h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+#topics .note { color: var(--muted); font-size: 12px; margin: 0 0 8px; }
+#topics code { background: var(--surface-2); padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+.topic-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; }
+.topic { display: block; width: 100%; text-align: left; background: none; border: 1px solid var(--border);
+  border-radius: 7px; padding: 6px 10px; font: inherit; color: inherit; cursor: pointer; }
+.topic b { font-weight: 600; }
+.topic small { display: block; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.topic.on { background: var(--accent-soft); border-color: var(--accent); }
+.topic:disabled { cursor: default; opacity: .65; }
 .empty { color: var(--muted); padding: 18px 0; text-align: center; }
 .chat-log { height: 260px; overflow-y: auto; background: var(--surface-2); border-radius: 8px; padding: 10px 12px;
   font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
@@ -128,6 +139,7 @@ button.primary:disabled { opacity: .5; cursor: default; }
     </h2>
     <div class="map-wrap"><canvas id="map"></canvas><div class="tip" id="tip"></div></div>
     <div class="legend" id="legend"></div>
+    <div id="topics"></div>
   </section>
 
   <div class="row2b">
@@ -186,6 +198,8 @@ $("theme").onclick = () => {
 
 // ---- state ---------------------------------------------------------------
 let status = null, heat = null, nodeColor = {}, mapMode = "heat";
+let topics = null, topicSel = null, hover = null;
+const tokenCache = new Map();   // "layer:expert" -> {at, data}
 const series = [];          // [time, tok/s]
 const SERIES_S = 120;
 
@@ -366,6 +380,8 @@ function drawChart() {
 
 // ---- expert map -------------------------------------------------------------
 let cell = { w: 0, h: 0, ox: 0, oy: 0 };
+const liftText = v => v >= 20 ? "×20+" : `×${v}`;
+const leansTo = (l, e, t) => ((topics && topics.affinity[`${l}:${e}`]) || []).some(a => a[0] === t);
 function drawMap() {
   if (!heat || !heat.layers) return;
   const c = $("map"), L = heat.layers, E = heat.experts;
@@ -384,7 +400,12 @@ function drawMap() {
     } else {
       ctx.fillStyle = nodeColor[heat.nodes[heat.owners[l][e]]] || PALETTE[heat.owners[l][e] % PALETTE.length];
     }
+    if (topicSel !== null) {     // the selected topic's experts stand out, even if never routed live
+      if (leansTo(l, e, topicSel)) ctx.fillStyle = css("--accent");
+      else ctx.globalAlpha = .15;
+    }
     ctx.fillRect(x, y, cw - (cw > 3 ? 1 : 0), ch - 1);
+    ctx.globalAlpha = 1;
   }
   ctx.strokeStyle = css("--mark"); ctx.lineWidth = 2;
   for (const [l, ex] of Object.entries(heat.last)) for (const e of ex)
@@ -410,11 +431,75 @@ $("map").addEventListener("mousemove", ev => {
   const r = ev.target.getBoundingClientRect(), x = ev.clientX - r.left, y = ev.clientY - r.top;
   const e = Math.floor((x - cell.ox) / cell.w), l = Math.floor((y - cell.oy) / cell.h);
   if (e < 0 || l < 0 || e >= heat.experts || l >= heat.layers) { tip.style.display = "none"; return; }
-  tip.textContent = `layer ${l} · expert ${e} · routed ${int(heat.counts[l][e])}× · on ${heat.nodes[heat.owners[l][e]]}`;
-  tip.style.display = "block";
-  tip.style.left = Math.min(x + 12, r.width - tip.offsetWidth - 4) + "px"; tip.style.top = (y + 14) + "px";
+  hover = { l, e, x, y, width: r.width };
+  showTip();
+  loadTokens(l, e);
 });
-$("map").addEventListener("mouseleave", () => { $("tip").style.display = "none"; });
+function showTip() {
+  if (!hover) return;
+  const tip = $("tip"), { l, e, x, y, width } = hover, key = `${l}:${e}`;
+  const owners = (heat.replicas && heat.replicas[key]) || [heat.owners[l][e]];
+  const lines = [`layer ${l} · expert ${e} · routed ${int(heat.counts[l][e])}× · on ${owners.map(i => heat.nodes[i]).join(", ")}`];
+  if (topics && topics.probed) {
+    const rows = (topics.affinity[key] || []).filter(a => topics.topics[a[0]] && topics.topics[a[0]].signal);
+    lines.push("topic affinity: " + (rows.length ? rows.map(a => `${topics.topics[a[0]].name} ${liftText(a[1])}`).join(", ") : "none stands out"));
+  } else if (topics && topics.available) {
+    lines.push("topic affinity: not measured yet");
+  }
+  const t = tokenCache.get(key);
+  if (t && t.data.tokens.length)
+    lines.push(`typical tokens (${t.data.source}): ` + t.data.tokens.map(k => JSON.stringify(k.text)).join(" "));
+  tip.textContent = lines.join("\n");
+  tip.style.display = "block";
+  tip.style.left = Math.max(0, Math.min(x + 12, width - tip.offsetWidth - 4)) + "px"; tip.style.top = (y + 14) + "px";
+}
+async function loadTokens(l, e) {
+  const key = `${l}:${e}`, have = tokenCache.get(key);
+  if (!topics || !topics.available || (have && Date.now() - have.at < 5000)) return;
+  tokenCache.set(key, { at: Date.now(), data: have ? have.data : { tokens: [] } });   // one request at a time
+  try {
+    const data = await getJSON(`/api/expert?layer=${l}&expert=${e}`);
+    tokenCache.set(key, { at: Date.now(), data });
+    if (hover && hover.l === l && hover.e === e) showTip();
+  } catch (err) {}
+}
+$("map").addEventListener("mouseleave", () => { hover = null; $("tip").style.display = "none"; });
+async function pollTopics() {
+  try {
+    topics = await getJSON("/api/topics");
+    if (topicSel !== null && !(topics.topics[topicSel] && topics.topics[topicSel].signal)) topicSel = null;
+    drawTopics(); drawMap();
+  } catch (e) {}
+  setTimeout(pollTopics, 15000);
+}
+function drawTopics() {
+  const box = $("topics"); box.replaceChildren();
+  if (!topics || !topics.available) { box.style.display = "none"; return; }
+  box.style.display = "";
+  box.append(el("h3", {}, "Observed topic affinity"),
+    el("p", { class: "note" }, "Measured from routing, not what experts were trained on: model files hold no such record. " +
+      "An expert is listed when a topic's passages pick it clearly more often than other topics' do."));
+  if (!topics.probed) {
+    box.append(el("p", { class: "note" }, "No probe for this model yet. Run ", el("code", {}, "python -m moelan probe --model <model>"),
+      " to measure it; this page updates by itself when it finishes."));
+    return;
+  }
+  const list = el("div", { class: "topic-list" });
+  topics.topics.forEach((t, i) => {
+    const detail = t.signal
+      ? `${int(t.experts)} experts (about ${t.chance} by chance)` + (t.best ? ` · strongest L${t.best.layer}·E${t.best.expert} ${liftText(t.best.lift)}` : "")
+      : `no clear signal: ${int(t.experts)} experts, about ${t.chance} by chance`;
+    const b = el("button", { class: "topic" + (topicSel === i ? " on" : ""), title: t.signal ? "Highlight these experts" : "Too close to chance to highlight" },
+      el("b", {}, t.name), el("small", {}, detail));
+    b.disabled = !t.signal;
+    b.addEventListener("click", () => { topicSel = topicSel === i ? null : i; drawTopics(); drawMap(); });
+    list.append(b);
+  });
+  box.append(list);
+  const lean = Object.values(topics.affinity).filter(r => r.some(a => topics.topics[a[0]] && topics.topics[a[0]].signal)).length;
+  box.append(el("p", { class: "note", style: "margin:8px 0 0" }, `${int(lean)} of ${int(topics.tested || 0)} experts lean to a listed topic. ` +
+    (topics.tracking ? "Typical tokens include live prompts (--expert-tokens)." : "Typical tokens come from the probe passages.")));
+}
 $("mapMode").addEventListener("click", ev => {
   const b = ev.target.closest("button"); if (!b) return;
   mapMode = b.dataset.m;
@@ -459,7 +544,7 @@ $("chat").addEventListener("submit", async ev => {
   } finally { $("send").disabled = false; }
 });
 
-pollStatus(); pollHeat();
+pollStatus(); pollHeat(); pollTopics();
 })();
 </script>
 </body>

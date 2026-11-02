@@ -21,12 +21,14 @@ import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
+from urllib.parse import parse_qs, urlsplit
 
 from . import kernels
 from .batching import Batcher, GenRequest
 from .model import MoEModel
 from .tokenizer import Tokenizer
 from .tools import parse_tool_calls, safe_prefix_len
+from .topics import TokenTracker, has_signal, load_topics, token_rows, topics_path
 
 MAX_BODY = 4 * 1024 * 1024
 DISCONNECTS = (ConnectionError, TimeoutError)   # resets, aborts, broken pipes (all OSError)
@@ -185,7 +187,12 @@ def heat_payload(model: MoEModel) -> dict:
         for (l, e), own in plan.owners.items():
             owners[l][e] = index.get(own[0], 0)
     last = {str(l): list(map(int, ex)) for l, ex in list(b.last.items())}
-    return {"layers": L, "experts": E, "counts": counts, "owners": owners, "nodes": nodes, "last": last}
+    replicas = {}
+    if plan is not None:     # experts held by several nodes; owners has the first one
+        replicas = {f"{l}:{e}": [index[n] for n in own if n in index]
+                    for (l, e), own in plan.owners.items() if len(own) > 1}
+    return {"layers": L, "experts": E, "counts": counts, "owners": owners, "nodes": nodes, "last": last,
+            "replicas": replicas}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -195,6 +202,7 @@ class _Handler(BaseHTTPRequestHandler):
     batcher: Batcher | None
     tel: Telemetry
     monitor = None  # WorkerMonitor in monitor-only mode
+    tracker = None  # TokenTracker with --expert-tokens: live prompts' tokens per expert
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *_):
@@ -222,6 +230,10 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"layers": 0, "experts": 0, "counts": [], "owners": [],
                                         "nodes": [], "last": {}})
             return self._json(200, heat_payload(self.model))
+        if path == "/api/topics":
+            return self._json(200, self.topics())
+        if path == "/api/expert":
+            return self.expert_tokens()
         if path == "/health":
             return self._json(200, {"ok": True, "model": self.name})
         if self.model is None:
@@ -231,6 +243,43 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/cluster":
             return self._json(200, {"nodes": node_stats(self.model), "moe_time_s": self.model.backend.moe_time})
         self._json(404, {"error": "not found"})
+
+    def _probe(self) -> dict | None:
+        """The saved ``moelan probe`` result of this model, reread if it changes."""
+        if self.model is None:
+            return None
+        path = topics_path(self.model.model_dir)
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        cached = type(self)._probe_cache
+        if cached is None or cached[0] != stamp:
+            cached = type(self)._probe_cache = (stamp, load_topics(path))
+        return cached[1]
+
+    def topics(self) -> dict:
+        probe = self._probe()
+        out = {"available": self.model is not None, "probed": probe is not None,
+               "tracking": self.tracker is not None, "topics": [], "affinity": {}}
+        if probe:
+            out.update(topics=[dict(t, signal=has_signal(t)) for t in probe["topics"]],
+                       affinity=probe["affinity"], tested=probe.get("tested"))
+        return out
+
+    def expert_tokens(self) -> None:
+        """Tokens typical of one expert: from live traffic if tracked, else the probe."""
+        q = parse_qs(urlsplit(self.path).query)
+        try:
+            layer, expert = int(q["layer"][0]), int(q["expert"][0])
+        except (KeyError, ValueError):
+            return self._json(400, {"error": "give layer and expert"})
+        if self.tracker is not None:
+            rows = token_rows(self.tracker, self.tok, layer, expert)
+            if rows:
+                return self._json(200, {"source": "live", "tokens": rows})
+        rows = (self._probe() or {}).get("tokens", {}).get(f"{layer}:{expert}")
+        return self._json(200, {"source": "probe" if rows else None, "tokens": rows or []})
 
     def status(self) -> dict:
         if self.model is None:
@@ -443,24 +492,29 @@ class WorkerMonitor(threading.Thread):
 def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
                 host: str = "127.0.0.1", port: int = 8000, monitor: WorkerMonitor | None = None,
                 max_batch: int = 4, prompt_cache_tokens: int = 16384, prompt_cache_dir=None,
-                prompt_cache_disk: int = 0):
+                prompt_cache_disk: int = 0, expert_tokens: bool = False):
     tel = Telemetry()
     batcher = None
     if model is not None:
         batcher = Batcher(model, tel, max_batch=max_batch, prompt_cache_tokens=prompt_cache_tokens,
                           prompt_cache_dir=prompt_cache_dir, prompt_cache_disk=prompt_cache_disk)
         batcher.start()
-    handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name,
-                                      "batcher": batcher, "tel": tel, "monitor": monitor})
+    tracker = None
+    if model is not None and expert_tokens:
+        tracker = TokenTracker()
+        model.on_route = tracker.observe
+    handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name, "batcher": batcher, "tel": tel,
+                                      "monitor": monitor, "tracker": tracker, "_probe_cache": None})
     return _Server((host, port), handler)
 
 
 def serve_http(model: MoEModel | None, tok: Tokenizer | None, name: str, host: str = "127.0.0.1",
                port: int = 8000, monitor: WorkerMonitor | None = None, max_batch: int = 4,
-               prompt_cache_tokens: int = 16384, prompt_cache_dir=None, prompt_cache_disk: int = 0):
+               prompt_cache_tokens: int = 16384, prompt_cache_dir=None, prompt_cache_disk: int = 0,
+               expert_tokens: bool = False):
     httpd = make_server(model, tok, name, host, port, monitor, max_batch=max_batch,
                         prompt_cache_tokens=prompt_cache_tokens, prompt_cache_dir=prompt_cache_dir,
-                        prompt_cache_disk=prompt_cache_disk)
+                        prompt_cache_disk=prompt_cache_disk, expert_tokens=expert_tokens)
     shown = "127.0.0.1" if host in ("0.0.0.0", "") else host
     print(f"dashboard:  http://{shown}:{port}/")
     if model is not None:

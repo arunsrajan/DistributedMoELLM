@@ -479,6 +479,7 @@ class MoEModel:
                                 heat=heat, mode=gpu_mode, progress=progress)
             backend = LocalBackend(store)
         self.backend = backend
+        self.on_route = None   # on_route(layer, tokens, expert ids): see topics.py
 
     def dense_bytes(self) -> int:
         n = self.embed.nbytes + self.norm.nbytes + self.lm_head.nbytes
@@ -556,7 +557,7 @@ class MoEModel:
         o = _mm(out.reshape(n, H * hd), L["o"])
         return o + L["ob"] if L["ob"] is not None else o
 
-    def _ffn(self, L, h, layer: int) -> np.ndarray:
+    def _ffn(self, L, h, layer: int, tokens: np.ndarray) -> np.ndarray:
         cfg = self.cfg
         if "mlp" in L:
             return expert_ffn(h, *L["mlp"])
@@ -567,6 +568,8 @@ class MoEModel:
             idx, w = route_sparsemixer(logits, cfg.router_jitter)
         else:
             idx, w = route(logits, cfg.top_k, cfg.norm_topk_prob)
+        if self.on_route is not None:
+            self.on_route(layer, tokens, idx)
         y = self.backend.moe(layer, h, idx, w)
         if "shared" in L:
             s = expert_ffn(h, *L["shared"])
@@ -638,7 +641,7 @@ class MoEModel:
             h = self._norm(x, L["in_norm"], L["in_norm_b"])
             x = x + self._attention(L, h, positions, segs, i)
             h = self._norm(x, L["post_norm"], L["post_norm_b"])
-            x = x + self._ffn(L, h, i)
+            x = x + self._ffn(L, h, i, tokens)
             if after_layer:
                 after_layer((i + 1) / len(self.layers))
         for a, b, cache in segs:

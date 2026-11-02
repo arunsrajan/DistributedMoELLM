@@ -205,7 +205,8 @@ second:
   token used outlined; hover for details.
 * **Recent requests** and a **Try it** chat box that streams from the model.
 
-JSON feeds behind it: `/api/status`, `/api/heat` (`/cluster` still works).
+JSON feeds behind it: `/api/status`, `/api/heat`, `/api/topics`, `/api/expert`
+(`/cluster` still works).
 To watch the workers without loading a model:
 
 ```bash
@@ -215,6 +216,41 @@ python -m moelan monitor --discover 2
 
 Use `--host 0.0.0.0` to open the dashboard from another machine; it has no
 login, so only do that on a trusted network.
+
+#### What experts respond to
+
+Experts have no trained topics: they are trained together with the router,
+without labels, and picked per token and per layer, and model files record
+nothing about subjects. What moelan can show is measured behaviour, under the
+expert map and in its tooltip:
+
+```bash
+python -m moelan probe --model <model>            # labelled passages, once per model
+python -m moelan serve --model <model> --expert-tokens   # optional: tokens from live prompts
+```
+
+* `moelan probe` reads 40 built-in passages from 8 topics (Code, Maths, Science,
+  Medicine, History, Law, Finance, Fiction; about 4,000 tokens, so minutes on a
+  fast setup and about half an hour at 2 tok/s), or your own with
+  `--prompts file.json`. It takes the same cluster options as `serve`, and a
+  running server picks up the result from `~/.moelan/topics/` by itself.
+* An expert counts as leaning to a topic when that topic's passages pick it at
+  least 1.5x as often as the others' do (z of 4 or more, and in at least 80% of
+  the topic's passages). The same test with shuffled labels gives the number
+  expected by chance, shown beside each topic; a topic not clearly above it says
+  "no clear signal" instead of naming experts.
+* Typical tokens come from the probe's passages, or from real traffic with
+  `--expert-tokens`. That flag is off by default because fragments of real
+  prompts then become visible to anyone who can open the dashboard, which has
+  no login.
+
+Measured on Qwen3-Coder-30B-A3B (colibri int4, 7 minutes on this laptop): 3,736
+of 6,144 experts lean to at least one topic, per topic 397 to 1,128 against 45
+to 118 by chance. Measured on 3 passages per topic and tested on the other 2,
+87-97% of flagged experts still lean the same way, against 15-45% of the
+others. So the leanings repeat, but they are leanings: most experts also serve
+other topics, and vocabulary and writing style surely drive part of them (one Law
+expert's typical tokens are `damages`, `Agreement`, `shall`). Other models may differ.
 
 Preview a placement without connecting anything:
 
@@ -491,6 +527,7 @@ been measured here, as this machine has none.
 | `moelan/batching.py` | continuous batching scheduler and prompt cache |
 | `moelan/tools.py` | tool calling: message normalization, tool-call parsing, safe streaming |
 | `moelan/accel.py` | GPU expert tier (CUDA / MPS / DirectML via PyTorch), calibration, hot-set choice |
+| `moelan/topics.py`, `moelan/probe_passages.py` | tokens per expert, topic probe and its statistics |
 | `moelan/dashboard.html` | the monitoring dashboard (one self-contained page) |
 | `moelan/tiny.py` | random tiny checkpoint for tests |
 
