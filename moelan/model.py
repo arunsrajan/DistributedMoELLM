@@ -480,6 +480,7 @@ class MoEModel:
             backend = LocalBackend(store)
         self.backend = backend
         self.on_route = None   # on_route(layer, tokens, expert ids): see topics.py
+        self.placed_by = (Counter(), None)   # the routing counts placement used, and their source
 
     def dense_bytes(self) -> int:
         n = self.embed.nbytes + self.norm.nbytes + self.lm_head.nbytes

@@ -381,7 +381,9 @@ function drawChart() {
 // ---- expert map -------------------------------------------------------------
 let cell = { w: 0, h: 0, ox: 0, oy: 0 };
 const liftText = v => v >= 20 ? "×20+" : `×${v}`;
+const subAffinity = () => (topics && topics.subtopics && topics.subtopics.affinity) || {};
 const leansTo = (l, e, t) => ((topics && topics.affinity[`${l}:${e}`]) || []).some(a => a[0] === t);
+const leansToSub = (l, e, t) => (subAffinity()[`${l}:${e}`] || []).some(a => a[0] === t);
 function drawMap() {
   if (!heat || !heat.layers) return;
   const c = $("map"), L = heat.layers, E = heat.experts;
@@ -401,7 +403,7 @@ function drawMap() {
       ctx.fillStyle = nodeColor[heat.nodes[heat.owners[l][e]]] || PALETTE[heat.owners[l][e] % PALETTE.length];
     }
     if (topicSel !== null) {     // the selected topic's experts stand out, even if never routed live
-      if (leansTo(l, e, topicSel)) ctx.fillStyle = css("--accent");
+      if (topicSel.sub ? leansToSub(l, e, topicSel.i) : leansTo(l, e, topicSel.i)) ctx.fillStyle = css("--accent");
       else ctx.globalAlpha = .15;
     }
     ctx.fillRect(x, y, cw - (cw > 3 ? 1 : 0), ch - 1);
@@ -446,6 +448,10 @@ function showTip() {
   } else if (topics && topics.available) {
     lines.push("topic affinity: not measured yet");
   }
+  if (topics && topics.subtopics) {
+    const rows = (subAffinity()[key] || []).filter(a => topics.subtopics.subtopics[a[0]] && topics.subtopics.subtopics[a[0]].signal);
+    if (rows.length) lines.push("sub-topics: " + rows.map(a => `${topics.subtopics.subtopics[a[0]].name} ${liftText(a[1])}`).join(", "));
+  }
   const t = tokenCache.get(key);
   if (t && t.data.tokens.length)
     lines.push(`typical tokens (${t.data.source}): ` + t.data.tokens.map(k => JSON.stringify(k.text)).join(" "));
@@ -467,34 +473,65 @@ $("map").addEventListener("mouseleave", () => { hover = null; $("tip").style.dis
 async function pollTopics() {
   try {
     topics = await getJSON("/api/topics");
-    if (topicSel !== null && !(topics.topics[topicSel] && topics.topics[topicSel].signal)) topicSel = null;
+    const chosen = topicSel && (topicSel.sub ? (topics.subtopics || { subtopics: [] }).subtopics : topics.topics)[topicSel.i];
+    if (topicSel && !(chosen && chosen.signal)) topicSel = null;
     drawTopics(); drawMap();
   } catch (e) {}
   setTimeout(pollTopics, 15000);
+}
+function topicButton(t, sub, i) {
+  const on = topicSel && topicSel.sub === sub && topicSel.i === i;
+  const detail = t.signal
+    ? `${int(t.experts)} experts (about ${t.chance} by chance)` + (t.best ? ` · strongest L${t.best.layer}·E${t.best.expert} ${liftText(t.best.lift)}` : "")
+    : t.tokens ? `no clear signal: ${int(t.experts)} experts, about ${t.chance} by chance` : "not enough passages yet";
+  const b = el("button", { class: "topic" + (on ? " on" : ""), title: t.signal ? "Highlight these experts" : "Too close to chance to highlight" },
+    el("b", {}, t.name), el("small", {}, detail));
+  b.disabled = !t.signal;
+  b.addEventListener("click", () => { topicSel = on ? null : { sub, i }; drawTopics(); drawMap(); });
+  return b;
+}
+function drawDevices(box) {
+  if (!topics.devices || !topics.devices.length) return;
+  box.append(el("h3", { style: "margin-top:12px" }, "Where experts run"),
+    el("p", { class: "note" }, topics.placed_by
+      ? `Placed by ${topics.placed_by}. Every device takes the share of picks its measured speed earns; each GPU holds its machine's most-picked experts.`
+      : "Placed by each device's measured speed. No routing counts yet, so experts are split evenly and picks are unknown."));
+  const head = el("tr", {}, ...["Machine", "Device", "Experts", "ms per expert", "Share of counted picks"].map(h => el("th", {}, h)));
+  const rows = topics.devices.map(d => el("tr", {}, el("td", {}, d.node), el("td", {}, d.device), el("td", {}, int(d.experts)),
+    el("td", {}, d.ms == null ? "–" : fmt(d.ms, 2)), el("td", {}, d.picks == null ? "–" : `${Math.round(100 * d.picks)}%`)));
+  box.append(el("div", { class: "table-wrap" }, el("table", {}, head, ...rows)));
+}
+function drawSubtopics(box) {
+  const s = topics.subtopics;
+  if (!s) return;
+  const pct = s.total ? Math.min(100, Math.round(100 * s.done / s.total)) : 0;
+  box.append(el("h3", { style: "margin-top:12px" }, `Sub-topics of "${s.topic}"`),
+    el("p", { class: "note" }, s.complete
+      ? `Finished: ${int(s.done)} passages written by the model, ${int(s.tokens)} tokens.`
+      : `Probe running or stopped: ${int(s.done)} of ${int(s.total)} passages, ${int(s.tokens)} tokens. This page updates by itself; the same command continues a stopped probe.`));
+  if (!s.complete) box.append(el("div", { class: "bar", style: "margin:0 0 8px" }, el("i", { style: `width:${pct}%` })));
+  const list = el("div", { class: "topic-list" });
+  s.subtopics.forEach((t, i) => list.append(topicButton(t, true, i)));
+  box.append(list);
+  const lean = Object.values(s.affinity).filter(r => r.some(a => s.subtopics[a[0]] && s.subtopics[a[0]].signal)).length;
+  box.append(el("p", { class: "note", style: "margin:8px 0 0" }, `${int(lean)} of ${int(s.tested || 0)} experts lean to a listed sub-topic, compared with the other sub-topics.`));
 }
 function drawTopics() {
   const box = $("topics"); box.replaceChildren();
   if (!topics || !topics.available) { box.style.display = "none"; return; }
   box.style.display = "";
-  box.append(el("h3", {}, "Observed topic affinity"),
+  drawDevices(box);
+  drawSubtopics(box);
+  box.append(el("h3", { style: "margin-top:12px" }, "Observed topic affinity"),
     el("p", { class: "note" }, "Measured from routing, not what experts were trained on: model files hold no such record. " +
       "An expert is listed when a topic's passages pick it clearly more often than other topics' do."));
   if (!topics.probed) {
     box.append(el("p", { class: "note" }, "No probe for this model yet. Run ", el("code", {}, "python -m moelan probe --model <model>"),
-      " to measure it; this page updates by itself when it finishes."));
+      " to measure it, or add ", el("code", {}, '--topic "your topic"'), " for sub-topics chosen by the model; this page updates by itself."));
     return;
   }
   const list = el("div", { class: "topic-list" });
-  topics.topics.forEach((t, i) => {
-    const detail = t.signal
-      ? `${int(t.experts)} experts (about ${t.chance} by chance)` + (t.best ? ` · strongest L${t.best.layer}·E${t.best.expert} ${liftText(t.best.lift)}` : "")
-      : `no clear signal: ${int(t.experts)} experts, about ${t.chance} by chance`;
-    const b = el("button", { class: "topic" + (topicSel === i ? " on" : ""), title: t.signal ? "Highlight these experts" : "Too close to chance to highlight" },
-      el("b", {}, t.name), el("small", {}, detail));
-    b.disabled = !t.signal;
-    b.addEventListener("click", () => { topicSel = topicSel === i ? null : i; drawTopics(); drawMap(); });
-    list.append(b);
-  });
+  topics.topics.forEach((t, i) => list.append(topicButton(t, false, i)));
   box.append(list);
   const lean = Object.values(topics.affinity).filter(r => r.some(a => topics.topics[a[0]] && topics.topics[a[0]].signal)).length;
   box.append(el("p", { class: "note", style: "margin:8px 0 0" }, `${int(lean)} of ${int(topics.tested || 0)} experts lean to a listed topic. ` +

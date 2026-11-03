@@ -21,8 +21,11 @@ import time
 from collections import Counter
 from pathlib import Path
 
+import numpy as np
+
 from .config import model_fingerprint
 from .model import load_heat
+from .topics import has_signal, summarize
 
 log = logging.getLogger("moelan.heat")
 
@@ -72,21 +75,112 @@ def _parse_heat(raw: dict) -> Counter:
     return Counter({tuple(int(v) for v in k.split(":")): c for k, c in raw.items()})
 
 
-def choose_heat(model_dir, cfg, explicit=None, progress=print) -> Counter:
-    """The routing counts placement should use, saying which it chose."""
+def heat_choice(model_dir, cfg, explicit=None, progress=print) -> tuple[Counter, str | None]:
+    """The routing counts placement should use, and where they come from."""
     if explicit:
-        return load_heat(explicit)
+        return load_heat(explicit), "the --heat file"
     traffic = load_heat(traffic_path(model_dir))
     n = tokens_of(traffic, cfg)
     if n >= MIN_TRAFFIC_TOKENS:
         progress(f"placing experts by real traffic (about {n} tokens)")
-        return traffic
+        return traffic, f"real traffic, about {n} tokens"
     doc = load_topic_heat(topic_path(model_dir))
     if doc and doc.get("heat"):
         progress(f"placing experts by the probe of {doc['topic']!r} ({n} of {MIN_TRAFFIC_TOKENS} tokens "
                  "of real traffic needed to replace it)")
-        return _parse_heat(doc["heat"])
-    return load_heat(Path(model_dir) / ".coli_usage")
+        return _parse_heat(doc["heat"]), f"the probe of \"{doc['topic']}\""
+    usage = load_heat(Path(model_dir) / ".coli_usage")
+    return usage, "colibri's .coli_usage" if usage else None
+
+
+def choose_heat(model_dir, cfg, explicit=None, progress=print) -> Counter:
+    return heat_choice(model_dir, cfg, explicit, progress)[0]
+
+
+def device_rows(model, heat) -> list[dict]:
+    """Every device of the cluster, CPU and GPU, with how many experts it holds and
+    the share of the counted picks those experts had. A worker reports only how many
+    experts its GPU took, and it takes its hottest, so that split is worked out here."""
+    total = sum(heat.values())
+    backend = model.backend
+    plan = getattr(backend, "plan", None)
+    local_store = getattr(backend, "local", None) or getattr(backend, "store", None)
+    speed = getattr(backend, "speed", None) or {}
+
+    def row(node, device, keys, ms):
+        picks = sum(heat.get(k, 0) for k in keys) / total if total else None
+        return {"node": node, "device": device, "experts": len(keys), "picks": picks, "ms": ms}
+
+    def split(node, keys, gpu_keys, gpu_name, cpu_ms, gpu_ms):
+        rows = []
+        if gpu_keys:
+            rows.append(row(node, gpu_name, gpu_keys, gpu_ms))
+        gpu_keys = set(gpu_keys)
+        rest = [k for k in keys if k not in gpu_keys]
+        if rest or not rows:
+            rows.append(row(node, "CPU", rest, cpu_ms))
+        return rows
+
+    local_gpu = getattr(local_store, "gpu", None)
+    local_gpu_keys = [k for k in (local_gpu.experts if local_gpu else {}) if k[0] >= 0]
+    local_gpu_name = local_gpu.name if local_gpu else None
+    if plan is None:
+        cfg = model.cfg
+        keys = [(l, e) for l in cfg.moe_layers() for e in range(cfg.num_experts)]
+        return split("local", keys, local_gpu_keys, local_gpu_name, None, local_gpu.gpu_ms if local_gpu else None)
+    rows = []
+    for nid, conn in backend.conns.items():
+        keys = plan.per_node.get(nid, [])
+        if not keys:
+            continue
+        info = (speed.get("nodes") or {}).get(nid) or {}
+        gpu = getattr(conn, "gpu", None) or {}
+        hottest = sorted(keys, key=lambda k: -heat.get(k, 0))[:gpu.get("experts", 0)]
+        rows += split(nid, keys, hottest, gpu.get("device"), info.get("cpu_ms"), (info.get("gpu") or {}).get("gpu_ms"))
+    mine = list(plan.per_node.get("local", [])) + list(plan.unplaced)
+    if mine:
+        rows += split("local", mine, local_gpu_keys, local_gpu_name, speed.get("local_cpu_ms"),
+                      (speed.get("local_gpu") or {}).get("gpu_ms"))
+    return rows
+
+
+def _summary(doc: dict, cfg) -> dict | None:
+    """Which experts lean to which sub-topic, from the passages counted so far."""
+    done = [p for p in doc["passages"] if p.get("counts")]
+    names = [s for s in doc["subtopics"] if any(p["sub"] == s for p in done)]
+    if len(names) < 2:
+        return None
+    counts = np.zeros((len(done), cfg.num_layers, cfg.num_experts), np.int32)
+    for i, p in enumerate(done):
+        for key, c in p["counts"].items():
+            l, e = key.split(":")
+            counts[i, int(l), int(e)] = c
+    tokens = np.array([p["tokens"] * cfg.top_k for p in done], np.float64)
+    labels = np.array([names.index(p["sub"]) for p in done], np.int32)
+    return summarize(counts, tokens, labels, names)
+
+
+def topic_status(doc: dict | None, cfg) -> dict | None:
+    """A topic probe as the dashboard shows it, finished or still running."""
+    if not doc:
+        return None
+    summary = doc.get("summary") or {"topics": [], "affinity": {}}
+    by_name = {t["name"]: t for t in summary["topics"]}
+    rows = []
+    for name in doc.get("subtopics") or []:
+        t = by_name.get(name)
+        passages = sum(1 for p in doc["passages"] if p["sub"] == name)
+        rows.append(dict(t, signal=has_signal(t)) if t else
+                    {"name": name, "passages": passages, "tokens": 0, "experts": 0, "chance": 0, "best": None,
+                     "signal": False})
+        rows[-1]["passages"] = passages
+    index = {t["name"]: i for i, t in enumerate(rows)}
+    order = [t["name"] for t in summary["topics"]]
+    affinity = {k: [[index[order[t]], v] for t, v in r] for k, r in summary["affinity"].items()}
+    total = len(doc.get("subtopics") or []) * doc.get("per_subtopic", 0)
+    return {"topic": doc["topic"], "complete": bool(doc.get("complete")), "done": len(doc["passages"]),
+            "total": total, "tokens": doc.get("tokens", 0), "subtopics": rows, "affinity": affinity,
+            "tested": len(cfg.moe_layers()) * cfg.num_experts}
 
 
 class TrafficRecorder:
@@ -161,6 +255,7 @@ def run_topic_probe(model, tok, topic: str, path, subtopics: int = 12, per_subto
     doc = load_topic_heat(path)
     if not doc or doc.get("topic") != topic:
         doc = {"topic": topic, "subtopics": names, "passages": [], "heat": {}, "tokens": 0, "complete": False}
+    doc["per_subtopic"], doc["complete"] = per_subtopic, False
     if not doc["subtopics"]:
         reply = ask(f"List {subtopics} distinct sub-topics of {topic}. Reply with a numbered list only, "
                     "a few words each, no explanations.", 15 * subtopics)
@@ -182,9 +277,12 @@ def run_topic_probe(model, tok, topic: str, path, subtopics: int = 12, per_subto
             prompt = KINDS[j % len(KINDS)].format(sub=sub, topic=topic) + " Start directly, no preamble."
             text = ask(prompt, passage_tokens, 0.7, 100 * i + j, record=counted)
             heat.update(counted)
-            doc["passages"].append({"sub": sub, "kind": j, "text": text})
-            doc["tokens"] += tokens_of(counted, model.cfg)
+            written = tokens_of(counted, model.cfg)
+            doc["passages"].append({"sub": sub, "kind": j, "text": text, "tokens": written,
+                                    "counts": {f"{l}:{e}": c for (l, e), c in counted.items()}})
+            doc["tokens"] += written
             doc["heat"] = {f"{l}:{e}": c for (l, e), c in heat.items()}
+            doc["summary"] = _summary(doc, model.cfg)
             _write_json(path, doc)
             made += 1
             spent = time.perf_counter() - t0

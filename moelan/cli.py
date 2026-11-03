@@ -68,7 +68,7 @@ def build_model(args):
     from .config import load_config
     from .coordinator import DistributedBackend
     from .discovery import discover
-    from .heatfiles import choose_heat
+    from .heatfiles import heat_choice
     from .model import MoEModel
     from .worker import parse_size
 
@@ -81,7 +81,7 @@ def build_model(args):
             if addr not in workers:
                 workers.append(addr)
     cfg = load_config(args.model)
-    heat = choose_heat(args.model, cfg, args.heat)
+    heat, source = heat_choice(args.model, cfg, args.heat)
     budget = parse_size(args.local_budget, 0)
     if not workers:
         print("no workers: every expert runs on this machine "
@@ -96,6 +96,7 @@ def build_model(args):
                                      replicate=not args.no_replicate, lru_size=args.lru,
                                      progress=print, placement=args.placement, **_gpu_kw(args))
         model = MoEModel(args.model, backend=backend, dense_format=args.dense_format)
+    model.placed_by = (heat, source)
     return model
 
 

@@ -2,17 +2,23 @@
 for the first start, then real traffic saved by the server."""
 
 import json
+import os
+import threading
+import urllib.request
 from collections import Counter
+from types import SimpleNamespace
 
 import pytest
 
 from moelan.cli import main
 from moelan.config import load_config
 from moelan.coordinator import DistributedBackend
-from moelan.heatfiles import (HALF_LIFE_TOKENS, MIN_TRAFFIC_TOKENS, TrafficRecorder, choose_heat, heat_dir,
-                              load_topic_heat, parse_subtopics, run_topic_probe, tokens_of, topic_path, traffic_path)
+from moelan.heatfiles import (HALF_LIFE_TOKENS, MIN_TRAFFIC_TOKENS, TrafficRecorder, _summary, choose_heat, device_rows, heat_dir,
+                              load_topic_heat, parse_subtopics, run_topic_probe, tokens_of, topic_path, topic_status,
+                              traffic_path)
 from moelan.model import MoEModel, load_heat
 from moelan.planner import LOCAL, make_plan
+from moelan.server import make_server
 from moelan.tiny import make_tiny
 from moelan.tokenizer import Tokenizer
 
@@ -205,3 +211,105 @@ def test_worker_chooses_gpu_experts_again_for_a_new_plan(tiny, tmp_path):
         backend.close()
     finally:
         w.kill()
+
+
+def _doc(names, per, planted=None, done=None):
+    """A probe file: each passage routes 100 tokens evenly, plus a planted lean."""
+    passages = []
+    for s in names:
+        for j in range(per):
+            counts = {f"0:{e}": 12 for e in range(16)}
+            counts.update({f"1:{e}": 12 for e in range(16)})
+            if s == planted:
+                counts["1:3"] = 120
+            passages.append({"sub": s, "kind": j, "text": "x", "tokens": 100, "counts": counts})
+    passages = passages[:done] if done is not None else passages
+    return {"topic": "t", "subtopics": names, "per_subtopic": per, "passages": passages, "heat": {"1:3": 9},
+            "tokens": 100 * len(passages), "complete": done is None}
+
+
+SMALL = SimpleNamespace(num_layers=2, num_experts=16, top_k=2, moe_layers=lambda: [0, 1])
+
+
+def test_subtopic_leanings_for_the_dashboard():
+    doc = _doc(["a", "b", "c"], 4, planted="b")
+    doc["summary"] = _summary(doc, SMALL)
+    s = topic_status(doc, SMALL)
+    assert s["complete"] and s["done"] == s["total"] == 12 and s["tested"] == 32
+    assert [t["name"] for t in s["subtopics"]] == ["a", "b", "c"] and s["subtopics"][1]["passages"] == 4
+    assert [t for t, _ in s["affinity"]["1:3"]] == [1]                     # leans to b, by b's place in the list
+    assert s["subtopics"][1]["experts"] >= 1
+
+
+def test_subtopics_show_while_the_probe_is_running():
+    doc = _doc(["a", "b", "c"], 4, done=1)
+    assert _summary(doc, SMALL) is None                                    # one sub-topic has nothing to compare
+    s = topic_status(doc, SMALL)
+    assert not s["complete"] and s["done"] == 1 and s["total"] == 12
+    assert [t["passages"] for t in s["subtopics"]] == [1, 0, 0] and not s["subtopics"][0]["signal"]
+    doc = _doc(["a", "b", "c"], 4, planted="b", done=6)                    # a and half of b; c not reached
+    doc["summary"] = _summary(doc, SMALL)
+    s = topic_status(doc, SMALL)
+    assert [t["name"] for t in s["subtopics"]] == ["a", "b", "c"]
+    assert not any(t == 2 for rows in s["affinity"].values() for t, _ in rows)
+    assert topic_status(None, SMALL) is None
+
+
+def test_probe_saves_counts_per_passage(tiny, tmp_path):
+    m, tok = MoEModel(tiny), Tokenizer(tiny)
+    r = run_topic_probe(m, tok, "t", tmp_path / "t.json", per_subtopic=1, passage_tokens=3, names=["a", "b"],
+                        progress=lambda msg: None)
+    assert all(p["tokens"] == 3 and p["counts"] for p in r["passages"])
+    assert r["summary"]["topics"][0]["name"] == "a" and r["per_subtopic"] == 1
+
+
+def test_device_table_lists_every_cpu_and_gpu(tiny, tmp_path):
+    m = MoEModel(tiny)
+    heat = Counter({(0, 0): 3, (1, 1): 1})
+    rows = device_rows(m, heat)
+    assert [(r["node"], r["device"], r["experts"]) for r in rows] == [("local", "CPU", 16)]
+    assert rows[0]["picks"] == 1.0
+    assert device_rows(m, Counter())[0]["picks"] is None                   # no counts, no claim
+    pytest.importorskip("torch")
+    gpu = MoEModel(tiny, gpu="torch-cpu", gpu_budget=2**30, gpu_mode="max")
+    rows = device_rows(gpu, heat)
+    assert rows[0]["device"].startswith("torch-cpu") and sum(r["experts"] for r in rows) == 16
+    w, c = Worker(tmp_path, "cpuw", 2**24), Worker(tmp_path, "gpuw", 2**24, gpu="torch-cpu", gpu_budget=2**30,
+                                                   gpu_mode="max")
+    try:
+        backend = DistributedBackend(str(tiny), load_config(tiny), [w.address, c.address], placement="ram",
+                                     replicate=False, heat=heat, progress=lambda msg: None)
+        rows = device_rows(MoEModel(tiny, backend=backend), heat)
+        devices = {(r["node"], r["device"].split(":")[0]) for r in rows}
+        assert ("cpuw", "CPU") in devices and any(n == "gpuw" and d.startswith("torch-cpu") for n, d in devices)
+        assert sum(r["experts"] for r in rows) == 16
+        assert sum(r["picks"] for r in rows) == pytest.approx(1.0)
+        backend.close()
+    finally:
+        w.kill()
+        c.kill()
+
+
+def test_dashboard_api_picks_up_a_running_probe(tiny):
+    m = MoEModel(tiny)
+    m.placed_by = (Counter({(0, 0): 1}), "the probe")
+    server = make_server(m, Tokenizer(tiny), "tiny", port=0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def get():
+        with urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/api/topics") as r:
+            return json.load(r)
+    try:
+        first = get()
+        assert first["subtopics"] is None and first["placed_by"] == "the probe"
+        assert first["devices"][0]["device"] == "CPU"
+        path = topic_path(tiny)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_doc(["a", "b"], 2, done=1)))
+        running = get()["subtopics"]
+        assert running["done"] == 1 and not running["complete"]
+        path.write_text(json.dumps(_doc(["a", "b"], 2)))
+        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 10**9))
+        assert get()["subtopics"]["complete"]
+    finally:
+        server.shutdown()

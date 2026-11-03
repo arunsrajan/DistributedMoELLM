@@ -408,6 +408,19 @@ real code's picks with 32 experts per layer, about the same as from unrelated
 topics, while half of the real text covered the other half at 63%. Prefer real
 traffic when there is any.
 
+CPUs count the same way as GPUs: every machine gets the share of the picks its
+measured speed earns, whether it has a GPU or not. Giving CPUs the same
+hottest-first rule as GPUs did not help: over 36 simulated cases on 9 clusters it was
+about 1% slower than this split, and without the share limit 9% slower than
+balancing. On a cluster of CPUs alone, measured speed does nearly all the work
+(119 down to 47.5 ms of expert time per token with a 0.10 and a 0.20 ms worker)
+and the counts add less than 2%. The dashboard's "Where experts run" table lists
+every CPU and GPU with its experts and share of the counted picks.
+
+While a topic probe runs, and after it, the dashboard shows its progress and the
+experts leaning to each sub-topic compared with the others; click a sub-topic to
+highlight them on the expert map.
+
 Counting while writing gives the same experts as reading the finished passages
 again (94-95% overlap, same coverage on other text), so no second pass is needed.
 A probe of 48 passages takes about an hour at the 1.7 tok/s this laptop reached.

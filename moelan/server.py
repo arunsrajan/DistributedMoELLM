@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import kernels
 from .batching import Batcher, GenRequest
+from .heatfiles import device_rows, load_topic_heat, topic_path, topic_status
 from .model import MoEModel
 from .tokenizer import Tokenizer
 from .tools import parse_tool_calls, safe_prefix_len
@@ -258,6 +259,18 @@ class _Handler(BaseHTTPRequestHandler):
             cached = type(self)._probe_cache = (stamp, load_topics(path))
         return cached[1]
 
+    def _topic_probe(self) -> dict | None:
+        """The ``moelan probe --topic`` result of this model, also while it is running."""
+        path = topic_path(self.model.model_dir)
+        try:
+            stamp = path.stat().st_mtime_ns
+        except OSError:
+            return None
+        cached = type(self)._topic_cache
+        if cached is None or cached[0] != stamp:
+            cached = type(self)._topic_cache = (stamp, topic_status(load_topic_heat(path), self.model.cfg))
+        return cached[1]
+
     def topics(self) -> dict:
         probe = self._probe()
         out = {"available": self.model is not None, "probed": probe is not None,
@@ -265,6 +278,9 @@ class _Handler(BaseHTTPRequestHandler):
         if probe:
             out.update(topics=[dict(t, signal=has_signal(t)) for t in probe["topics"]],
                        affinity=probe["affinity"], tested=probe.get("tested"))
+        if self.model is not None:
+            heat, source = self.model.placed_by
+            out.update(subtopics=self._topic_probe(), placed_by=source, devices=device_rows(self.model, heat))
         return out
 
     def expert_tokens(self) -> None:
@@ -504,7 +520,8 @@ def make_server(model: MoEModel | None, tok: Tokenizer | None, name: str,
         tracker = TokenTracker()
         model.on_route = tracker.observe
     handler = type("H", (_Handler,), {"model": model, "tok": tok, "name": name, "batcher": batcher, "tel": tel,
-                                      "monitor": monitor, "tracker": tracker, "_probe_cache": None})
+                                      "monitor": monitor, "tracker": tracker, "_probe_cache": None,
+                                      "_topic_cache": None})
     return _Server((host, port), handler)
 
 
