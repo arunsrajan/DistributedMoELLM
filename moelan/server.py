@@ -27,6 +27,7 @@ from . import kernels
 from .batching import Batcher, GenRequest
 from .heatfiles import device_rows, load_topic_heat, topic_path, topic_status
 from .model import MoEModel
+from .protocol import ExclusivePort
 from .tokenizer import Tokenizer
 from .tools import parse_tool_calls, safe_prefix_len
 from .topics import TokenTracker, has_signal, load_topics, token_rows, topics_path
@@ -36,7 +37,7 @@ DISCONNECTS = (ConnectionError, TimeoutError)   # resets, aborts, broken pipes (
 log = logging.getLogger("moelan.server")
 
 
-class _Server(ThreadingHTTPServer):
+class _Server(ExclusivePort, ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request, client_address):

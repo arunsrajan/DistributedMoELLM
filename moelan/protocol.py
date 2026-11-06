@@ -123,6 +123,51 @@ def decode_rows(arrays: dict, name: str) -> np.ndarray:
     return a.astype(np.float32, copy=False)
 
 
+class ExclusivePort:
+    """Mixin for socketserver servers: a port another program already listens
+    on is refused, on every system. Elsewhere SO_REUSEADDR only lets a server
+    restart on a port its last run left in TIME_WAIT, but on Windows it lets a
+    second program listen on a port that is in use, so a second worker (or
+    server) started on the same port came up without an error and took some of
+    the first one's connections. Windows gets SO_EXCLUSIVEADDRUSE instead."""
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):            # Windows
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def _port_taken(exc: OSError) -> bool:
+    import errno
+    # 10048 / 10013: Windows' WSAEADDRINUSE, and WSAEACCES when the holder bound exclusively
+    return exc.errno in (errno.EADDRINUSE, 10048, 10013) or getattr(exc, "winerror", None) in (10048, 10013)
+
+
+def check_port_free(host: str, port: int, what: str) -> None:
+    """Exit with a clear message if something already listens on host:port,
+    before a slow start-up (loading a model, placing experts) rather than
+    after it. The server binds the port again when it starts; this is only the
+    early, friendly check."""
+    if not port:
+        return
+    s = socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET)
+    try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+    except OSError as e:
+        if _port_taken(e):
+            raise SystemExit(f"moelan {what}: port {port} on {host} is already in use (another moelan "
+                             f"{what}, or another program, listens there). Stop it, or pick another "
+                             "--port.") from None
+        raise
+    finally:
+        s.close()
+
+
 def tune_socket(sock: socket.socket) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):

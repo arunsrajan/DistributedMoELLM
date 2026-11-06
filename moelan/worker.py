@@ -31,7 +31,8 @@ from . import __version__
 from .config import load_config, model_fingerprint
 from .discovery import Beacon, local_ip
 from .experts import CacheSource, ExpertStore, open_source, resident_bytes
-from .protocol import PROTOCOL_VERSION, decode_rows, encode_rows, recv_msg, send_msg, tune_socket
+from .protocol import (PROTOCOL_VERSION, ExclusivePort, decode_rows, encode_rows, recv_msg, send_msg,
+                       tune_socket)
 
 log = logging.getLogger("moelan.worker")
 
@@ -349,7 +350,7 @@ class _Handler(socketserver.BaseRequestHandler):
         raise ValueError(f"unknown op {op!r}")
 
 
-class _Server(socketserver.ThreadingTCPServer):
+class _Server(ExclusivePort, socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
 

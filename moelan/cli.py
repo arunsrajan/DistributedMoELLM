@@ -109,7 +109,9 @@ def build_model(args):
 
 def cmd_worker(args) -> None:
     from . import kernels
+    from .protocol import check_port_free
     from .worker import parse_size, serve
+    check_port_free(args.host, args.port, "worker")
     kernels.warn_if_slow()
     serve(host=args.host, port=args.port, budget=parse_size(args.budget, None) if args.budget else None,
           cache_root=args.cache, model_dir=args.model, node_id=args.name,
@@ -216,9 +218,11 @@ def cmd_run(args) -> None:
 
 def cmd_serve(args) -> None:
     from .heatfiles import traffic_path
+    from .protocol import check_port_free
     from .server import serve_http
     from .tokenizer import Tokenizer
     from .worker import parse_size
+    check_port_free(args.host, args.port, "serve")
     model = build_model(args)
     serve_http(model, Tokenizer(args.model, args.tokenizer), Path(args.model).name, args.host, args.port,
                max_batch=args.max_batch, prompt_cache_tokens=args.prompt_cache_tokens,
@@ -284,10 +288,12 @@ def cmd_probe(args) -> None:
 
 
 def cmd_monitor(args) -> None:
+    from .protocol import check_port_free
     from .server import WorkerMonitor, serve_http
     workers = [w.strip() for w in args.workers.split(",") if w.strip()]
     if not workers and not args.discover:
         sys.exit("give --workers host:port,... and/or --discover SECONDS")
+    check_port_free(args.host, args.port, "monitor")
     mon = WorkerMonitor(workers, interval=args.interval, discover_s=args.discover)
     mon.start()
     serve_http(None, None, "monitor", args.host, args.port, monitor=mon)
