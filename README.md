@@ -279,11 +279,13 @@ Laptop: Ryzen 5 5500U (6 cores / 12 threads), 32 GB, Wi-Fi. Decode, greedy,
 | numba kernels, f32 attention/head (previous default) | 2.1-2.4 |
 | numba kernels, attention/head as stored 16-bit (exact) | 3.1-3.3 |
 | numba kernels, `--dense-format int8` | 3.5-3.9 |
-| **+ one compiled call per MoE layer for the experts, 16-bit (default, exact)** | **4.0** |
-| **+ one compiled call per MoE layer, `--dense-format int8`** | **4.8** |
+| + one compiled call per MoE layer for the experts, 16-bit (exact) | 3.4-4.0 |
+| + one compiled call per MoE layer, `--dense-format int8` | 4.5-4.8 |
+| **+ int8 activations in that call (AVX2), 16-bit attention (default)** | **4.1-4.3** |
+| **+ int8 activations in that call (AVX2), `--dense-format int8`** | **5.3-5.4** |
 | coordinator + 1 worker process, same laptop | 2.5 |
 | coordinator + 2 worker processes, same laptop | 3.0 |
-| colibri (C/SIMD) on a similar CPU, its README | 8.5-13 |
+| colibri (C/SIMD) on this laptop, `coli serve --cap 128`, once its cache is warm | 10.5-10.7 |
 
 Measured with the model files in the OS file cache and nothing else holding
 RAM. The 15 GB of experts are read through that cache, so on a 32 GB machine
@@ -291,19 +293,45 @@ another large process (a second moelan server, a browser with many tabs)
 pushes experts out to disk and speed can halve.
 
 Where one token's time goes on one machine, with `--dense-format int8`
-(measured, 48 tokens): routed experts 0.11 s, attention and the output head
-0.08 s, norms and the rest 0.02 s. The experts used to take 0.20 s: each of the
-384 expert evaluations per token was its own kernel call plus Python around
-it, and less than half of that time was the kernel. Now the int4 experts a
-layer picks for its few rows (generating; prompts keep their BLAS path) go
-through one compiled call: gate and up, SiLU, down and the weighted sum, for
-all of them, reading the weights in place. The kernel then reads about 11 GB/s
-of weights out of the 40 GB/s this laptop's RAM gives, and the arithmetic of
-unpacking 4-bit values is the limit now, not Python. Same machine, same text,
-`run` with 64 tokens: 3.3 -> 4.0 tok/s with 16-bit attention, 3.9 -> 4.8
-tok/s with int8. `MOELAN_FUSED=0` goes back to one call per expert, for
-comparing. Workers use the same call, and speed placement measures nodes
-with it.
+(measured, 48 tokens, 0.19 s a token): routed experts 0.08 s, attention and
+the output head 0.08 s (of which 0.02 s scores over the cache), norms 0.015 s,
+router and the rest 0.015 s.
+
+The experts used to take 0.20 s: each of the 384 expert evaluations per token
+was its own kernel call plus Python around it, and less than half of that
+time was the kernel. Now the int4 experts a layer picks for its few rows
+(generating; prompts keep their BLAS path) go through one compiled call: gate
+and up, SiLU, down and the weighted sum, for all of them, reading the weights
+in place. That alone gave 3.3 -> 4.0 tok/s with 16-bit attention and 3.9 ->
+4.8 with int8 (`run`, 64 tokens). `MOELAN_FUSED=0` goes back to one call per
+expert, for comparing.
+
+That call then read about 11 GB/s of the 40 GB/s this laptop's RAM gives:
+widening every 4-bit weight to a float was the limit. So on CPUs with AVX2
+the call now rounds the activations to int8 (one scale per group of 64, as
+llama.cpp does for its 4-bit formats) and multiplies 4-bit weights by int8
+activations with integer multiply-adds (`pmaddubsw` / `pmaddwd`, written as
+LLVM vector code through numba). One token's 384 experts: 92 -> 60 ms, about
+17 GB/s. The cost is rounding: against float activations the layer output
+differs by about 0.8% (rms; cosine 0.99997 on Qwen3-Coder's own weights), and
+two test answers through `serve` (64 and 128 tokens) came out word for word
+the same. `MOELAN_INT8_ACT=0` keeps the
+activations float (exact to the int4 weights). Groups other than multiples of
+64, and CPUs without AVX2, keep the float kernel; in a cluster whose nodes
+differ in that, outputs can differ in the last digits. Same machine, `run`
+with 64 tokens: 4.45 -> 5.3-5.4 tok/s with int8 attention, 3.4 -> 4.1-4.3
+with 16-bit. Through `serve`, timed by a streaming client: 3.6-4.2 -> 5.7-5.9
+tok/s for 64 tokens, 4.1 -> 4.9-5.1 for 128. Workers use the same call, and
+speed placement measures nodes with it.
+
+colibri, timed the same way on this laptop, generates 10.5-10.7 tok/s once
+its expert cache is warm (4.1-4.6 tok/s for a prompt's first answer, while
+that cache fills). Most of the remaining gap is not arithmetic: on their own,
+the int8 attention and output-head kernels read their 1.3 GB per token in
+0.04 s (32 GB/s), and the experts' kernel takes 0.06 s, so about 0.09 s of
+the 0.19 s is mostly Python and numpy work between the kernels (norms,
+rotary, scores, routing, many small array calls per layer), which colibri,
+written in C, does not have.
 
 Loopback round trip 0.08 ms; the full per-layer request/reply overhead is
 about 0.4 ms.
@@ -316,13 +344,13 @@ With separate machines, decode time per token is roughly
 
 | N identical laptops, `--dense-format int8` | wired gigabit (RTT ~0.3 ms) | Wi-Fi (RTT ~3 ms) |
 |---|---|---|
-| 1 | 4.8 tok/s | 4.8 tok/s |
-| 2 | about 5.4 tok/s | about 3.2 tok/s |
-| 4 | about 6.4 tok/s | about 3.5 tok/s |
+| 1 | 5.3 tok/s | 5.3 tok/s |
+| 2 | about 5.6 tok/s | about 3.2 tok/s |
+| 4 | about 6.3 tok/s | about 3.5 tok/s |
 
-These are estimates from the measured parts (experts 0.11 s, the rest 0.10 s
+These are estimates from the measured parts (experts 0.08 s, the rest 0.11 s
 per token), not measurements. The ceiling is the coordinator's dense part
-(~10 tok/s). So: on wired Ethernet more machines
+(~9 tok/s). So: on wired Ethernet more machines
 help moderately; on Wi-Fi the 48 round trips per token eat the gain. The
 reliable win is capacity: a model whose experts do not fit in one machine's
 RAM (Qwen3-235B-A22B, ~120 GB int4) runs from RAM across several machines

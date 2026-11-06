@@ -24,6 +24,12 @@ BLAS_FROM = 8        # from this many rows (prompt reading), widen the matrix on
 # One compiled call per MoE layer for the experts few rows picked (generating):
 # MOELAN_FUSED=0 goes back to one call per matrix, for comparing.
 FUSED = os.environ.get("MOELAN_FUSED", "1") != "0"
+# In that call, on CPUs with AVX2, the activations are rounded to int8 (one
+# scale per weight group) so the dot products run as integer multiply-adds,
+# llama.cpp's way: about 1.5x faster, ~0.8% (rms) off the float result.
+# MOELAN_INT8_ACT=0 keeps them float (exact to the int4 weights).
+INT8_ACT = os.environ.get("MOELAN_INT8_ACT", "1") != "0"
+AVX2 = False
 
 if os.environ.get("MOELAN_KERNELS", "1") != "0":
     try:
@@ -33,6 +39,28 @@ if os.environ.get("MOELAN_KERNELS", "1") != "0":
         WHY_DISABLED = "numba is not installed for this Python"
 else:
     WHY_DISABLED = "MOELAN_KERNELS=0"
+
+
+def _has_avx2() -> bool:
+    """Whether numba compiles for a CPU with AVX2: the host's own, unless
+    NUMBA_CPU_NAME picked another target (then only if NUMBA_CPU_FEATURES says so).
+    Checked before compiling: LLVM aborts the process on an instruction the
+    target lacks, it does not raise."""
+    try:
+        import platform
+        if platform.machine().lower() not in ("amd64", "x86_64", "x64"):
+            return False
+        from numba.core import config
+        if config.CPU_NAME:
+            return "+avx2" in (config.CPU_FEATURES or "")
+        import llvmlite.binding as ll
+        return bool(ll.get_host_cpu_features().get("avx2"))
+    except Exception:  # pragma: no cover - depends on the environment
+        return False
+
+
+if ENABLED:
+    AVX2 = _has_avx2()
 
 
 def warn_if_slow(stream=None) -> bool:
@@ -753,6 +781,146 @@ if ENABLED:
             for j in range(H):
                 out[r, j] += w * y[p, j]
 
+    # The same call with int8 activations. One 64-weight chunk (32 bytes, two
+    # nibbles each) against 32 even and 32 odd int8 activations is a few AVX2
+    # instructions, written here as LLVM vector code (numba widens small-integer
+    # products to 64 bits, which is slower than the float kernel):
+    #   pmaddubsw(nibbles, activations) -> 16 x int16 pair sums (at most
+    #   2 * 15 * 127, no saturation), pmaddwd(., 1) -> 8 x int32, then a sum.
+    from llvmlite import ir as _ir
+
+    _I8, _I16, _I32 = _ir.IntType(8), _ir.IntType(16), _ir.IntType(32)
+    _V32I8, _V16I16, _V8I32 = _ir.VectorType(_I8, 32), _ir.VectorType(_I16, 16), _ir.VectorType(_I32, 8)
+
+    def _vload(builder, addr, ty):
+        p = builder.inttoptr(addr, cgutils.voidptr_t)
+        try:
+            return builder.load(p, align=1, typ=ty)                 # llvmlite >= 0.44
+        except TypeError:  # pragma: no cover - older llvmlite, typed pointers
+            return builder.load(builder.bitcast(p, ty.as_pointer()), align=1)
+
+    def _splat(builder, vt, scalar):
+        v = builder.insert_element(_ir.Constant(vt, None), scalar, _ir.Constant(_I32, 0))
+        return builder.shuffle_vector(v, _ir.Constant(vt, None),
+                                      _ir.Constant(_ir.VectorType(_I32, vt.count), [0] * vt.count))
+
+    @intrinsic
+    def _q4c64(typingctx, raw, xe, xo, xr):
+        """sum of unsigned nibble * int8 activation over one 64-weight chunk:
+        addresses of its 32 weight bytes and of the 32 even / 32 odd activations,
+        and the XOR that makes the nibbles unsigned."""
+        sig = types.int32(types.int64, types.int64, types.int64, types.int64)
+
+        def codegen(context, builder, signature, args):
+            mod = builder.module
+            ubsw = cgutils.get_or_insert_function(
+                mod, _ir.FunctionType(_V16I16, [_V32I8, _V32I8]), "llvm.x86.avx2.pmadd.ub.sw")
+            wd = cgutils.get_or_insert_function(
+                mod, _ir.FunctionType(_V8I32, [_V16I16, _V16I16]), "llvm.x86.avx2.pmadd.wd")
+            w = builder.xor(_vload(builder, args[0], _V32I8), _splat(builder, _V32I8, builder.trunc(args[3], _I8)))
+            m15 = _ir.Constant(_V32I8, [15] * 32)
+            lo = builder.and_(w, m15)
+            hi = builder.and_(builder.lshr(w, _ir.Constant(_V32I8, [4] * 32)), m15)
+            s = builder.add(builder.call(ubsw, [lo, _vload(builder, args[1], _V32I8)]),
+                            builder.call(ubsw, [hi, _vload(builder, args[2], _V32I8)]))
+            v = builder.call(wd, [s, _ir.Constant(_V16I16, [1] * 16)])
+            parts = [builder.extract_element(v, _ir.Constant(_I32, j)) for j in range(8)]
+            while len(parts) > 1:
+                parts = [builder.add(parts[j], parts[j + 1]) for j in range(0, len(parts), 2)]
+            return parts[0]
+        return sig, codegen
+
+    @njit(fastmath=True, cache=True, nogil=True)
+    def _round_q8(v, gs, qe, qo, d, s8):
+        # v rounded to int8 per group of gs, even / odd values apart (as the
+        # nibbles lie); d: each group's scale, s8: 8 * the sum of its int8 values
+        half = gs // 2
+        for g in range(v.shape[0] // gs):
+            m = np.float32(0.0)
+            for i in range(g * gs, (g + 1) * gs):
+                m = max(m, abs(v[i]))
+            sc = m / np.float32(127.0) if m > 0 else np.float32(1.0)
+            inv = np.float32(1.0) / sc
+            s = np.int32(0)
+            for j in range(half):
+                a = np.int32(np.floor(v[g * gs + 2 * j] * inv + np.float32(0.5)))
+                b = np.int32(np.floor(v[g * gs + 2 * j + 1] * inv + np.float32(0.5)))
+                qe[g * half + j] = a
+                qo[g * half + j] = b
+                s += a + b
+            d[g] = sc
+            s8[g] = np.int32(8) * s
+
+    @njit(parallel=True, fastmath=True, cache=True, nogil=True)
+    def _moe_q4i(xs, ptrs, xors, poff, prow, pw, H, I, gs, qe, qo, dq, q8, ae, ao, da, a8, out):
+        # As _moe_q4, with int8 activations: per group, s_w * s_x * (sum of
+        # nibble * x - 8 * sum of x), the sums exact in int32. The int8 buffers
+        # (qe, qo for the inputs, ae, ao for the SiLU outputs) come from the
+        # caller: they are read by address, and numba would free an array of
+        # its own after its last use as an array, before the reads.
+        k = ptrs.shape[0]
+        P = prow.shape[0]
+        n = xs.shape[0]
+        O1, C1, G1 = 2 * I, H // 2, H // gs
+        C2, G2 = I // 2, I // gs
+        half = gs // 2
+        nc = gs // 64
+        for r in range(n):
+            _round_q8(xs[r], gs, qe[r], qo[r], dq[r], q8[r])
+        qeb, qob = qe.ctypes.data, qo.ctypes.data
+        h = np.empty((P, O1), np.float32)
+        for t in prange(k * O1):
+            e = t // O1
+            o = t - e * O1
+            rb = ptrs[e, 0] + o * C1
+            sc = carray(_at(ptrs[e, 1]), (O1, G1), np.float32)
+            xr = np.int64(xors[e])
+            for p in range(poff[e], poff[e + 1]):
+                r = prow[p]
+                eb, ob = qeb + r * C1, qob + r * C1
+                acc = np.float32(0.0)
+                for g in range(G1):
+                    isum = np.int32(0)
+                    for c in range(nc):
+                        off = g * half + c * 32
+                        isum += _q4c64(rb + off, eb + off, ob + off, xr)
+                    acc += np.float32(isum - q8[r, g]) * (sc[o, g] * dq[r, g])
+                h[p, o] = acc
+        for p in prange(P):
+            act = np.empty(I, np.float32)
+            for i in range(I):
+                g0 = h[p, i]
+                act[i] = g0 / (np.float32(1.0) + np.exp(-g0)) * h[p, I + i]
+            _round_q8(act, gs, ae[p], ao[p], da[p], a8[p])
+        aeb, aob = ae.ctypes.data, ao.ctypes.data
+        y = np.empty((P, H), np.float32)
+        for t in prange(k * H):
+            e = t // H
+            o = t - e * H
+            rb = ptrs[e, 2] + o * C2
+            sc = carray(_at(ptrs[e, 3]), (H, G2), np.float32)
+            xr = np.int64(xors[e])
+            for p in range(poff[e], poff[e + 1]):
+                eb, ob = aeb + p * C2, aob + p * C2
+                acc = np.float32(0.0)
+                for g in range(G2):
+                    isum = np.int32(0)
+                    for c in range(nc):
+                        off = g * half + c * 32
+                        isum += _q4c64(rb + off, eb + off, ob + off, xr)
+                    acc += np.float32(isum - a8[p, g]) * (sc[o, g] * da[p, g])
+                y[p, o] = acc
+        for p in range(P):
+            r = prow[p]
+            w = pw[p]
+            for j in range(H):
+                out[r, j] += w * y[p, j]
+
+
+def int8_act_for(H: int, I: int, gs: int) -> bool:
+    """Whether :func:`moe_q4` runs experts of this shape with int8 activations."""
+    return INT8_ACT and AVX2 and gs % 64 == 0 and H % gs == 0 and I % gs == 0
+
 
 def _addr(a: np.ndarray) -> int:
     return a.__array_interface__["data"][0]
@@ -774,19 +942,29 @@ def q4_expert_ptrs(e) -> tuple[int, int, int, int, int] | None:
 def moe_q4(x: np.ndarray, items, H: int, I: int, gs: int, out: np.ndarray) -> None:
     """Add ``sum_e w * expert_e(x[rows])`` into ``out`` for colibri int4
     experts in one call. ``items``: (ptrs from :func:`q4_expert_ptrs`, rows,
-    gate weights) per expert; the arrays behind the pointers must stay alive."""
+    gate weights) per expert; the arrays behind the pointers must stay alive.
+    Activations are rounded to int8 when :func:`int8_act_for` says so."""
     rows = np.concatenate([r for _, r, _ in items]).astype(np.int64, copy=False)
     uniq, prow = np.unique(rows, return_inverse=True)
     xs = np.ascontiguousarray(x[uniq], np.float32)
-    xe, xo = np.ascontiguousarray(xs[:, 0::2]), np.ascontiguousarray(xs[:, 1::2])
-    xsum = xs.reshape(xs.shape[0], -1, gs).sum(2)
     ptrs = np.array([p[:4] for p, _, _ in items], np.int64)
     xors = np.array([p[4] for p, _, _ in items], np.uint8)
     poff = np.zeros(len(items) + 1, np.int64)
     np.cumsum([len(r) for _, r, _ in items], out=poff[1:])
     pw = np.concatenate([w for _, _, w in items]).astype(np.float32, copy=False)
+    prow = prow.astype(np.int64)
     part = np.zeros((len(uniq), H), np.float32)
-    _moe_q4(xe, xo, xsum, ptrs, xors, poff, prow.astype(np.int64), pw, H, I, gs, part)
+    if int8_act_for(H, I, gs):
+        n, P = len(uniq), len(prow)
+        _moe_q4i(xs, ptrs, xors, poff, prow, pw, H, I, gs,
+                 np.empty((n, H // 2), np.int8), np.empty((n, H // 2), np.int8),
+                 np.empty((n, H // gs), np.float32), np.empty((n, H // gs), np.int32),
+                 np.empty((P, I // 2), np.int8), np.empty((P, I // 2), np.int8),
+                 np.empty((P, I // gs), np.float32), np.empty((P, I // gs), np.int32), part)
+    else:
+        xe, xo = np.ascontiguousarray(xs[:, 0::2]), np.ascontiguousarray(xs[:, 1::2])
+        xsum = xs.reshape(xs.shape[0], -1, gs).sum(2)
+        _moe_q4(xe, xo, xsum, ptrs, xors, poff, prow, pw, H, I, gs, part)
     out[uniq] += part
 
 
