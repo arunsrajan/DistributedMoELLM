@@ -238,6 +238,8 @@ function render() {
                      `${m.moe_layers} MoE layers × ${m.experts} experts, top-${m.top_k}`,
                      `experts ${m.expert_format}`, `dense ${m.dense_format} · ${gib(m.dense_bytes)}`, m.backend])
       chips.append(el("span", { class: "chip" }, t));
+    if (m.ssd && m.ssd !== "off")
+      chips.append(el("span", { class: "chip", title: ({ distributed: "experts on the workers' SSDs, one copy each", replicated: "every expert on every worker's SSD" })[m.ssd] || "" }, `SSD ${m.ssd}`));
     chips.append(m.kernels === "numba" ? el("span", { class: "chip" }, "numba kernels")
       : el("span", { class: "chip warn", title: "Install numba in a Python it supports (3.10-3.13) for ~10x speed" }, "numpy fallback: slow"));
   } else chips.append(el("span", { class: "chip" }, "no model loaded: health of workers only"));
@@ -309,11 +311,20 @@ function renderNodes(nodes) {
     const ram = n.resident_bytes != null ? gib(n.resident_bytes) + (n.budget_bytes ? " / " + gib(n.budget_bytes) : "") : "–";
     const extra = n.node === "local" ? `disk reads ${int(n.disk_reads)} · RAM hits ${int(n.hits)}`
       : n.kernels === "numpy" ? "numpy fallback: slow" : (n.error || "");
+    // its own experts, plus (replicated SSD mode) copies of other nodes' experts; how many sit in RAM
+    const held = int(n.experts) + (n.copies ? ` + ${int(n.copies)} copies` : "");
+    const tiers = n.ssd_experts ? ` · ${int(n.ram_experts)} RAM / ${int(n.ssd_experts)} SSD` : "";
+    const expTitle = n.ssd_experts
+      ? `${int(n.ram_experts)} kept in RAM (the hottest), ${int(n.ssd_experts)} computed from ${n.node === "local" ? "this machine's disk" : "its SSD"}`
+        + (n.copies ? `; ${int(n.copies)} are copies of other nodes' experts, used when those are busy or down` : "")
+        + (n.ssd_reads != null ? ` · computed from the SSD ${int(n.ssd_reads)}× so far` : "")
+        + (n.disk_budget_bytes ? ` · SSD budget ${gib(n.disk_budget_bytes)}` : "")
+      : "";
     return el("tr", {},
       el("td", {}, el("span", { class: "dot", style: `background:${nodeColor[n.node] || PALETTE[0]}` }), n.node),
       el("td", { class: "mono" }, n.address || "–"),
       el("td", { class: n.alive ? "status-ok" : "status-bad" }, n.alive ? "● up" : "● down"),
-      el("td", { class: "num" }, int(n.experts)),
+      el("td", { class: "num", title: expTitle }, held + tiers),
       el("td", { title: n.speed && n.speed.layer_ms ? `expected ${fmt(n.speed.layer_ms, 1)} ms per layer for the experts, ${fmt(n.speed.layer_ms_alone, 1)} ms on this machine alone` : "" },
         !n.speed ? "–" : n.node === "local"
           ? `${fmt(n.speed.expert_ms, 2)} ms/expert${gpuNote(n.speed)} · ${Math.round(100 * n.speed.share)}% of work`

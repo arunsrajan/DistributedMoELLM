@@ -58,6 +58,11 @@ that already fits.
   flight at once, while the coordinator computes its own experts.
 * **Colibri-style fallback.** Experts that fit nowhere are streamed from the
   coordinator's disk (memory-mapped safetensors, LRU cache).
+* **Experts on the workers' SSDs too** (`--ssd distributed|replicated`): each
+  worker keeps its hottest experts in RAM and computes the rest from its SSD,
+  so a model bigger than the cluster's RAM is read by all the SSDs at once
+  (distributed), or every worker holds the whole model and covers for a
+  failed one (replicated). See "Experts on the workers' SSDs".
 * **Fault tolerance.** If a worker drops out, its requests move to a replica,
   else to the coordinator's disk, and generation continues with the same
   output. Dead workers are retried every 30 s.
@@ -577,6 +582,75 @@ speed (1.75 tok/s). A discrete NVIDIA GPU runs an expert in well under a
 millisecond, which is where the hybrid mode is meant to pay off; that has not
 been measured here, as this machine has none.
 
+### Experts on the workers' SSDs (`--ssd distributed`, `--ssd replicated`)
+
+By default a worker holds only what its RAM budget fits, and the coordinator
+computes everything else from its own disk, so for a model bigger than the
+cluster's RAM one machine's SSD reads the whole overflow. With `--ssd` the
+workers' SSDs join in: each worker keeps its hottest experts in RAM
+(`--budget`) and computes the rest straight from its SSD through memory maps,
+as Colibri does on one machine; the OS page cache keeps the recently used
+ones. On a worker, `--disk` caps the SSD space for experts the coordinator
+pushes (default: half the free space on the cache's drive). A worker started
+with `--model` reads its own copy of the model and needs no space.
+
+| | `--ssd off` (default) | `--ssd distributed` | `--ssd replicated` |
+|---|---|---|---|
+| a worker holds | what its RAM fits | its share, as far as its SSD allows | its share, plus copies of the other experts, as many as its SSD fits |
+| in its RAM | all of them | its hottest, up to `--budget` | its own hottest first, then copies if RAM is left |
+| the rest of the model | the coordinator's disk | spread over the workers' SSDs (the coordinator's disk only when they are full) | on every worker whose SSD fits it |
+| a worker fails | a replica or the coordinator takes its experts | the coordinator takes them | a worker with copies takes them (the coordinator, those nobody copied) |
+| first start, workers without the model | each gets its share | each gets its share | each gets as much of the model as `--disk` holds, once (about 2.5 min per 16 GB on gigabit) |
+
+```bash
+python -m moelan worker --budget 12G --disk 200G                    # each helper machine
+python -m moelan serve --model ~/models/Qwen3-235B-A22B --discover 3 --ssd distributed
+python -m moelan serve --model ~/models/Qwen3-30B-A3B   --discover 3 --ssd replicated
+```
+
+The split of the work does not change: `--placement speed` still shares the
+routed work by each node's measured speed, now capped by what its SSD holds
+instead of its RAM, and `--placement ram` splits it in proportion to the
+workers' RAM. In replicated mode each expert still has one primary node,
+which computes it while it is up. Another holder takes it when that holder has
+the expert in RAM and is less busy in that layer (long prompts, batches), or
+when the primary is down; only when no worker holding it is up does the
+coordinator compute it.
+
+Which one: **distributed** when the model is much bigger than the cluster's
+RAM (every SSD reads only its share, all at the same time). **Replicated**
+when each worker's SSD can hold the whole model and you want the workers to
+cover for each other, rather than a failed worker's share landing on the
+coordinator's disk; copying the model to the workers and starting them with
+`--model` avoids the first transfer.
+
+When a new plan gives a worker different experts, it deletes cached experts of
+that model it no longer holds, as far as needed to stay within `--disk`; other
+models' caches are left alone and count against the space. On Linux and macOS
+every expert computed from the cache keeps its file open, so the worker raises
+its open-files limit and keeps at most 4096 of them open at a time (fewer if the
+limit stays low).
+
+Checked on Qwen3-Coder-30B-A3B (colibri int4, 6,144 experts, 19 GB) with two
+worker processes on this laptop, each given 1 GB of RAM for experts (404 of
+them) and the rest on its SSD. Each run wrote 16 tokens (greedy) and was
+compared with the laptop on its own:
+
+| run | each worker holds | same tokens as alone | one worker killed after token 6 |
+|---|---|---|---|
+| `--ssd distributed`, `--disk 4G` | 1,617 experts, pushed (4 GB in 31 s over loopback) | yes | not tried |
+| `--ssd replicated`, workers started with `--model` | all 6,144 | yes | the other worker took all of its experts; the coordinator computed none |
+| `--ssd replicated`, `--disk 8G` | 3,235: its own ~3,070 plus ~160 copies of the other's hottest | yes | the other worker took the ones it had copies of; the coordinator computed the rest |
+
+On one machine the three processes share one CPU and one page cache, so this
+shows that the modes give the same output and survive a lost worker. It does
+not show how fast they are on a LAN, which needs separate machines.
+
+The dashboard's node table shows, per node, how many of its experts are in
+RAM and how many it computes from its SSD (and, in replicated mode, how many
+are copies of other nodes' experts); the expert map's tooltip lists every node
+holding an expert.
+
 ## 5. Layout
 
 | File | Role |
@@ -584,13 +658,13 @@ been measured here, as this machine has none.
 | `moelan/safetensors_io.py` | memory-mapped safetensors reader/writer, bf16 |
 | `moelan/config.py` | config parsing, per-family tensor names, checkpoint fingerprint |
 | `moelan/model.py` | numpy transformer: RMSNorm, RoPE, GQA, q/k norm, router, KV cache, sampling |
-| `moelan/experts.py` | expert store and formats (f32 / int8 / colibri int4), memory-mapped streaming |
+| `moelan/experts.py` | expert store and formats (f32 / int8 / colibri int4), RAM tier and memory-mapped SSD tier |
 | `moelan/kernels.py` | optional numba kernels for group-scaled int4/int8/f32 mat-vec |
-| `moelan/planner.py` | expert placement and replication |
+| `moelan/planner.py` | expert placement and replication, SSD copies for `--ssd replicated` |
 | `moelan/heatfiles.py` | routing counts for placement: real traffic and topic probes |
 | `moelan/protocol.py` | framed JSON + array wire protocol |
-| `moelan/worker.py` | expert worker server |
-| `moelan/coordinator.py` | distributed backend: setup, transfer, per-layer fan-out, failover |
+| `moelan/worker.py` | expert worker server: hottest experts in RAM, the rest from its SSD within `--disk` |
+| `moelan/coordinator.py` | distributed backend: setup, transfer, `--ssd` modes, per-layer fan-out, failover |
 | `moelan/discovery.py` | UDP broadcast discovery |
 | `moelan/server.py` | OpenAI-compatible HTTP API, dashboard feeds, worker monitor |
 | `moelan/batching.py` | continuous batching scheduler and prompt cache |
@@ -602,8 +676,9 @@ been measured here, as this machine has none.
 
 Tests (`python -m pytest tests`) check that distributed generation is token
 for token identical to single-machine generation, with expert transfer,
-cache reuse, partial clusters, a worker killed mid-generation, and replica
-takeover. With `pip install -e ".[ref]"` (torch + transformers),
+cache reuse, partial clusters, a worker killed mid-generation, replica
+takeover, and both SSD modes (a worker's RAM and SSD tiers, `--disk` limits,
+and another worker taking over in replicated mode). With `pip install -e ".[ref]"` (torch + transformers),
 `tests/test_hf_reference.py` also compares moelan's logits with transformers'
 own DeepSeek V2, DeepSeek V3 and Qwen3-MoE implementations on tiny random
 checkpoints (they agree to about 1e-5).

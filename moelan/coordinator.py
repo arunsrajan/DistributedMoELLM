@@ -7,6 +7,17 @@ so a token costs one round trip per worker per layer, all workers in flight at
 once. The coordinator computes its own experts while the workers compute
 theirs. If a worker fails, its share is recomputed locally from disk and the
 worker is retried later.
+
+``ssd`` picks where workers keep their experts:
+
+  off          RAM only: a worker holds what its RAM budget fits, the rest
+               stays on the coordinator's disk (the default)
+  distributed  each expert on one worker's SSD: workers keep their hottest in
+               RAM and compute the rest from the SSD, so the cluster's SSDs
+               together hold the model and read it in parallel
+  replicated   every worker keeps (as far as its SSD allows) every expert:
+               each still serves its own share first, but any holder can take
+               an expert, so a failed worker's experts move to another worker
 """
 
 from __future__ import annotations
@@ -26,12 +37,13 @@ import numpy as np
 from .config import ModelConfig, model_fingerprint
 from .experts import ExpertStore, bench_expert, default_format, open_source, resident_bytes
 from .model import ExpertBackend, group_by_expert
-from .planner import LOCAL, Plan, make_plan, node_ms, speed_shares
+from .planner import LOCAL, Plan, add_ssd_copies, make_plan, node_ms, speed_shares
 from .protocol import (PROTOCOL_VERSION, WIRE_FORMATS, decode_rows, encode_rows, recv_msg, send_msg,
                        tune_socket)
 
 log = logging.getLogger("moelan.coordinator")
 RETRY_AFTER_S = 30.0
+SSD_MODES = ("off", "distributed", "replicated")
 
 # MOELAN_SIM_NET="rtt_ms,mbit_per_s" adds half a round trip plus the transfer
 # time to every message to and from workers, to measure wire formats and LAN
@@ -65,6 +77,10 @@ class WorkerConn:
     wait_s: float = 0.0       # coordinator blocked on this worker's reply
     remote_s: float = 0.0     # of which the worker was computing
     resident_bytes: int = 0
+    in_ram: set = field(default_factory=set)   # experts it keeps in RAM (the rest: from its SSD)
+    ram_experts: int = 0
+    ssd_experts: int = 0
+    ssd_reads: int = 0        # experts it computed from its SSD (or the OS page cache)
 
     @property
     def node_id(self) -> str:
@@ -107,7 +123,8 @@ class WorkerConn:
             self.sock.settimeout(self.timeout)
 
     def mark_failed(self, exc: Exception) -> None:
-        log.warning("worker %s failed: %s; its experts fall back to the coordinator", self.address, exc)
+        log.warning("worker %s failed: %s; its experts move to another node holding them, else to "
+                    "the coordinator", self.address, exc)
         self.alive = False
         self.failed_at = time.monotonic()
         try:
@@ -132,10 +149,13 @@ class DistributedBackend(ExpertBackend):
                  local_budget: int = 0, heat=None, fmt: str | None = None,
                  wire: str = "f32", replicate: bool = True, lru_size: int = 0,
                  progress=None, gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto",
-                 placement: str = "speed"):
+                 placement: str = "speed", ssd: str = "off"):
         super().__init__()
         if placement not in ("speed", "ram"):
             raise ValueError("placement must be speed or ram")
+        if ssd not in SSD_MODES:
+            raise ValueError(f"ssd must be one of {SSD_MODES}")
+        self.ssd = ssd
         self.heat_in = dict(heat or {})
         self.gpu_spec, self.gpu_budget, self.gpu_mode = gpu, gpu_budget, gpu_mode
         if wire not in WIRE_FORMATS:
@@ -163,11 +183,25 @@ class DistributedBackend(ExpertBackend):
                 self.progress(f"skipping {addr}: {exc}")
 
         self.expert_ram = resident_bytes(cfg, fmt)
+        # one expert's file in a worker's cache: its tensors plus a small header
+        self.disk_bytes = max(self.source.nbytes((l, 0)) for l in cfg.moe_layers()) + 512
         self.local_budget = local_budget
         self.speed: dict = {}
         self.fast: list[tuple[str, int, float]] = []    # nodes with a useful GPU: experts it holds, ms each
         budgets = {nid: c.info["budget_bytes"] for nid, c in self.conns.items()}
         shares = None
+        caps: dict[str, int] = {}
+        if ssd != "off":
+            # capacity is what a worker's SSD holds; its RAM keeps the hottest of them
+            caps = {nid: self._disk_cap(c) for nid, c in self.conns.items()}
+            ram = dict(budgets)
+            budgets = {nid: n * self.expert_ram for nid, n in caps.items()}
+            replicate = False   # replicated mode copies by SSD space below, not by spare RAM
+            if placement == "ram":   # split in proportion to RAM, as far as each SSD allows
+                if local_budget > 0:
+                    ram[LOCAL] = local_budget
+                total_ram = sum(ram.values()) or 1
+                shares = {nid: b / total_ram for nid, b in ram.items()}
         if placement == "speed" and self.conns:
             shares = self._measure_speeds(budgets)
             # the coordinator computes its share from its own checkpoint: no RAM cap
@@ -177,8 +211,45 @@ class DistributedBackend(ExpertBackend):
             budgets[LOCAL] = local_budget
         self.plan: Plan = make_plan(cfg.moe_layers(), cfg.num_experts, self.expert_ram,
                                     budgets, heat=heat, replicate=replicate, shares=shares, fast=self.fast)
+        if ssd == "replicated":
+            add_ssd_copies(self.plan, cfg.moe_layers(), cfg.num_experts,
+                           {nid: n for nid, n in caps.items() if nid in self.plan.per_node}, heat=heat)
         self.progress("placement plan:\n" + self.plan.summary(self.expert_ram))
+        if ssd != "off":
+            self._describe_ssd(caps)
         self._setup_all()
+
+    # ---- SSD modes ---------------------------------------------------------
+    def _disk_cap(self, c: WorkerConn) -> int:
+        """Experts of this model a worker can keep on its SSD."""
+        n_all = len(self.cfg.moe_layers()) * self.cfg.num_experts
+        if c.info.get("local_model") == self.fingerprint:
+            return n_all                       # it reads its own copy of the model
+        if "disk_budget_bytes" not in c.info:  # an older worker: RAM only
+            self.progress(f"{c.node_id}: older moelan, no SSD tier; holds what its RAM fits")
+            return min(n_all, c.info["budget_bytes"] // self.expert_ram)
+        other = sum(b for fp, b in (c.info.get("cached_bytes") or {}).items() if fp != self.fingerprint)
+        return max(0, min(n_all, (int(c.info["disk_budget_bytes"]) - other) // self.disk_bytes))
+
+    def _describe_ssd(self, caps: dict[str, int]) -> None:
+        n_all = len(self.cfg.moe_layers()) * self.cfg.num_experts
+        for nid, c in self.conns.items():
+            own = len(self.plan.per_node.get(nid, []))
+            held = own + len(self.plan.held.get(nid, []))
+            ram = min(held, c.info["budget_bytes"] // self.expert_ram)
+            where = "its own copy of the model" if c.info.get("local_model") == self.fingerprint else \
+                f"room for {caps.get(nid, 0)} of {n_all} on its SSD"
+            if not held:
+                self.progress(f"{nid}: no experts ({where})")
+                continue
+            copies = f", {held - own} of them copies of other nodes' experts" if held > own else ""
+            self.progress(f"{nid}: {held} experts on its SSD{copies} ({where}); "
+                          f"about {ram} in RAM, the rest computed from the SSD")
+        if self.ssd == "replicated":
+            full = [nid for nid in self.plan.per_node if nid != LOCAL and
+                    len(self.plan.per_node[nid]) + len(self.plan.held.get(nid, [])) >= n_all]
+            self.progress(f"replicated: {len(full)} of {len(self.plan.per_node) - (LOCAL in self.plan.per_node)} "
+                          "workers hold every expert")
 
     # ---- speed-aware placement ------------------------------------------------
     def _measure_speeds(self, budgets: dict[str, int]) -> dict[str, float]:
@@ -292,13 +363,25 @@ class DistributedBackend(ExpertBackend):
 
     def _setup_worker(self, c: WorkerConn) -> None:
         keys = self.plan.per_node.get(c.node_id, [])
-        h, _ = c.call({"op": "assign", "fingerprint": self.fingerprint, "config": self.cfg.raw,
-                       "meta": self.meta, "experts": [list(k) for k in keys], "format": self.fmt,
-                       "heat": [int(self.heat_in.get(k, 0)) for k in keys]})
+        extra = self.plan.held.get(c.node_id, [])
+        msg = {"op": "assign", "fingerprint": self.fingerprint, "config": self.cfg.raw,
+               "meta": self.meta, "experts": [list(k) for k in keys], "format": self.fmt,
+               "heat": [int(self.heat_in.get(k, 0)) for k in keys]}
+        if self.ssd != "off":
+            msg.update(extra=[list(k) for k in extra], extra_heat=[int(self.heat_in.get(k, 0)) for k in extra],
+                       disk_bytes=self.disk_bytes)
+        h, _ = c.call(msg)
         missing = [tuple(k) for k in h["missing"]]
+        if h.get("freed_bytes"):
+            self.progress(f"{c.node_id}: removed {h['freed_bytes'] / 2**30:.2f} GiB of experts it no longer "
+                          "holds, to stay within its --disk")
         if missing:
             mb = len(missing) * self.source.nbytes(missing[0]) / 2**20
-            self.progress(f"{c.node_id}: sending {len(missing)} experts ({mb:.0f} MiB)")
+            note = ""
+            if self.ssd == "replicated" and len(missing) > len(keys) and mb / 110 >= 60:
+                note = (f"; about {mb / 110 / 60:.0f} min on gigabit, once: start the worker with "
+                        "--model on its own copy of the model to skip it")
+            self.progress(f"{c.node_id}: sending {len(missing)} experts ({mb:.0f} MiB){note}")
         t0 = time.perf_counter()
         window = 16  # puts in flight; the worker answers in order
         sent = acked = nbytes = 0
@@ -320,11 +403,20 @@ class DistributedBackend(ExpertBackend):
         h, _ = c.call({"op": "load", "fingerprint": self.fingerprint}, timeout=900)
         c.resident_bytes = h["resident_bytes"]
         c.gpu = h.get("gpu") or {}
+        # an older worker pins everything it was given and does not say so
+        c.in_ram = {tuple(k) for k in h["pinned"]} if "pinned" in h else set(keys)
+        c.ram_experts = h.get("ram_experts", len(keys))
+        c.ssd_experts = h.get("ssd_experts", 0)
         if c.gpu.get("experts"):
             self.progress(f"{c.node_id}: {c.gpu['experts']} experts on {c.gpu['device']} "
                           f"(GPU share {c.gpu['share']:.0%})")
-        self.progress(f"{c.node_id}: {len(keys)} experts resident "
-                      f"({h['resident_bytes'] / 2**30:.2f} GiB, loaded in {h['load_s']:.1f}s)")
+        if c.ssd_experts:
+            self.progress(f"{c.node_id}: {c.ram_experts} experts in RAM "
+                          f"({h['resident_bytes'] / 2**30:.2f} GiB, loaded in {h['load_s']:.1f}s), "
+                          f"{c.ssd_experts} computed from its SSD")
+        else:
+            self.progress(f"{c.node_id}: {c.ram_experts} experts resident "
+                          f"({h['resident_bytes'] / 2**30:.2f} GiB, loaded in {h['load_s']:.1f}s)")
 
     def _setup_all(self) -> None:
         conns = list(self.conns.values())
@@ -357,15 +449,19 @@ class DistributedBackend(ExpertBackend):
 
     # ---- the hot path ------------------------------------------------------
     def _owner(self, layer: int, expert: int, load: dict[str, int]) -> str:
-        owners = self.plan.owners.get((layer, expert))
+        """Who computes this expert now: among the live nodes holding it, those
+        with it in RAM (its primary always counts), least loaded first, the
+        primary on ties; else any live holder (from its SSD); else this machine."""
+        key = (layer, expert)
+        owners = self.plan.owners.get(key)
         if not owners:
             return LOCAL
-        best = None
-        for nid in owners:
-            if nid == LOCAL or (nid in self.conns and self.conns[nid].alive):
-                if best is None or load.get(nid, 0) < load.get(best, 0):
-                    best = nid
-        return best or LOCAL
+        prim = owners[0]
+        alive = [n for n in owners if n == LOCAL or (n in self.conns and self.conns[n].alive)]
+        if not alive:
+            return LOCAL
+        warm = [n for n in alive if n == prim or n == LOCAL or key in self.conns[n].in_ram]
+        return min(warm or alive, key=lambda n: (load.get(n, 0), n != prim))
 
     def _moe(self, layer, x, idx, w):
         self._maybe_reconnect()
@@ -418,6 +514,7 @@ class DistributedBackend(ExpertBackend):
                 try:
                     h, arrays = c.recv()
                     c.remote_s += h.get("compute_s", 0.0)
+                    c.ssd_reads = h.get("ssd_reads", c.ssd_reads)
                     c.bytes_in += sum(a.nbytes for a in arrays.values())
                     out[uniq[arrays["rows"]]] += decode_rows(arrays, "y")
                 except (OSError, RuntimeError, ConnectionError) as exc:
@@ -436,11 +533,16 @@ class DistributedBackend(ExpertBackend):
                    "compute_s": c.remote_s, "budget_bytes": c.info.get("budget_bytes"),
                    "cpus": c.info.get("cpus"), "resident_bytes": c.resident_bytes,
                    "kernels": c.info.get("kernels"), "gpu": getattr(c, "gpu", None) or None,
+                   "ram_experts": c.ram_experts, "ssd_experts": c.ssd_experts, "ssd_reads": c.ssd_reads,
+                   "copies": len(self.plan.held.get(c.node_id, [])),
+                   "disk_budget_bytes": c.info.get("disk_budget_bytes") if self.ssd != "off" else None,
                    "speed": ({"share": 0.0, "same_host": True} if c.node_id in self.speed.get("same_host", [])
                              else self.speed.get("nodes", {}).get(c.node_id))}
             out.append(row)
+        mine = len(self.plan.per_node.get(LOCAL, [])) + len(self.plan.unplaced)
         out.append({"node": LOCAL, "address": "-", "alive": True,
                     "experts": len(self.plan.per_node.get(LOCAL, [])),
+                    "ram_experts": len(self.local.pinned), "ssd_experts": max(0, mine - len(self.local.pinned)),
                     "disk_reads": self.local.misses, "hits": self.local.hits,
                     "resident_bytes": self.local.resident_bytes(),
                     "gpu": self.local.gpu.stats() if self.local.gpu else self.local.gpu_info,

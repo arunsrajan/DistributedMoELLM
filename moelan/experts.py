@@ -404,6 +404,8 @@ class CheckpointSource:
     def __init__(self, model_dir: str | Path, cfg: ModelConfig):
         self.cfg = cfg
         self.st = SafeTensorDir(model_dir)
+        # int4 experts are views of the shared memory map: keeping them costs no RAM
+        self.zero_copy = cfg.expert_layout == "colibri_int4"
 
     def _names(self, key: ExpertKey) -> dict[str, str]:
         return dict(zip(_part_names(self.cfg), self.cfg.expert_names(*key)))
@@ -440,6 +442,9 @@ class CacheSource:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.cfg = cfg
+        # int4 and GGUF experts are views of their file's memory map (each file
+        # its own map, so the store keeps a bounded number of them open)
+        self.zero_copy = cfg is not None and cfg.expert_layout in ("colibri_int4", "gguf")
 
     def _path(self, key: ExpertKey) -> Path:
         return self.root / f"L{key[0]:03d}_E{key[1]:04d}.safetensors"
@@ -453,6 +458,22 @@ class CacheSource:
             l, e = p.stem[1:].split("_E")
             out.append((int(l), int(e)))
         return sorted(out)
+
+    def nbytes(self, key: ExpertKey) -> int:
+        try:
+            return self._path(key).stat().st_size
+        except OSError:
+            return 0
+
+    def remove(self, key: ExpertKey) -> bool:
+        """Delete one cached expert; False if the OS refuses (still mapped)."""
+        try:
+            self._path(key).unlink()
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
 
     def put(self, key: ExpertKey, raw: dict[str, tuple[bytes, str, list[int]]]) -> None:
         # Keep the original dtype on disk; GGUF blocks as raw bytes, their type
@@ -494,7 +515,7 @@ class CacheSource:
 
 class ExpertStore:
     def __init__(self, sources: list, fmt: str = "f32", lru_size: int = 0,
-                 threads: int | None = None, gs: int = 64):
+                 threads: int | None = None, gs: int = 64, map_size: int = 4096):
         if fmt not in FORMATS:
             raise ValueError(f"format must be one of {FORMATS}")
         self.sources = [s for s in sources if s is not None]
@@ -503,11 +524,15 @@ class ExpertStore:
         self.lru_size = lru_size
         self.pinned: dict[ExpertKey, Expert] = {}
         self.lru: OrderedDict[ExpertKey, Expert] = OrderedDict()
-        self.mapped: dict[ExpertKey, Expert] = {}
+        # experts not in RAM that are zero-copy views of a memory-mapped file
+        # (the SSD tier): the OS page cache does the caching, this only saves
+        # re-opening them; bounded, since each pushed expert is its own file
+        self.mapped: OrderedDict[ExpertKey, Expert] = OrderedDict()
+        self.map_size = map_size
         self.gpu = None       # accel.GpuTier when a GPU holds some of this node's experts
-        self.gpu_info = None  # its stats, also when calibration decided not to use it  # zero-copy views, OS page cache does the caching
+        self.gpu_info = None  # its stats, also when calibration decided not to use it
         self.hits = 0
-        self.misses = 0
+        self.misses = 0       # experts computed from the memory-mapped source (SSD or page cache)
         self._lock = threading.Lock()
         self.threads = threads or default_threads()
         self._pool = ThreadPoolExecutor(self.threads, thread_name_prefix="moelan-expert") \
@@ -518,10 +543,13 @@ class ExpertStore:
         return self.fmt
 
     def _read(self, key: ExpertKey, fmt: str | None = None) -> Expert:
+        return self._read_from(key, fmt)[0]
+
+    def _read_from(self, key: ExpertKey, fmt: str | None = None):
         for src in self.sources:
             if src.has(key):
                 e = src.load(key)
-                return to_format(e, fmt, self.gs) if fmt else e
+                return (to_format(e, fmt, self.gs) if fmt else e), src
         raise KeyError(f"expert {key} is not available on this node")
 
     def can_serve(self, key: ExpertKey) -> bool:
@@ -542,6 +570,15 @@ class ExpertStore:
             if key not in keep:
                 del self.pinned[key]
 
+    def forget(self, keys) -> None:
+        """Drop every in-memory reference to ``keys`` (before deleting their files)."""
+        with self._lock:
+            for k in keys:
+                k = tuple(k)
+                self.pinned.pop(k, None)
+                self.lru.pop(k, None)
+                self.mapped.pop(k, None)
+
     def get(self, key: ExpertKey) -> Expert:
         w = self.pinned.get(key)
         if w is not None:
@@ -553,17 +590,20 @@ class ExpertStore:
                 self.lru.move_to_end(key)
                 self.hits += 1
                 return w
-        w = self.mapped.get(key)
-        if w is not None:
-            self.misses += 1
-            return w
+            w = self.mapped.get(key)
+            if w is not None:
+                self.mapped.move_to_end(key)
+                self.misses += 1
+                return w
         self.misses += 1
         # Not resident: compute straight from the (memory-mapped) source format.
-        w = self._read(key)
-        if isinstance(w.gu, Packed4) and not w.gu.offset:
-            self.mapped[key] = w  # views of the memory map cost no RAM: keep them all
-        elif self.lru_size > 0:
-            with self._lock:
+        w, src = self._read_from(key)
+        with self._lock:
+            if getattr(src, "zero_copy", False) or (isinstance(w.gu, Packed4) and not w.gu.offset):
+                self.mapped[key] = w      # views of the memory map cost no RAM
+                while len(self.mapped) > self.map_size:
+                    self.mapped.popitem(last=False)
+            elif self.lru_size > 0:
                 self.lru[key] = w
                 while len(self.lru) > self.lru_size:
                     self.lru.popitem(last=False)

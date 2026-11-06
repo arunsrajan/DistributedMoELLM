@@ -373,6 +373,8 @@ PARTS = ("gate", "up", "down")
 class GGUFSource:
     """Experts read straight out of a GGUF file (memory-mapped, not copied)."""
 
+    zero_copy = True   # experts are views of the one memory map
+
     def __init__(self, path, cfg):
         self.cfg = cfg
         self.g = open_gguf(path)

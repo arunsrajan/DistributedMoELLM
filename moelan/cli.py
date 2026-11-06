@@ -49,6 +49,12 @@ def _add_cluster_args(p: argparse.ArgumentParser) -> None:
                    help="speed: measure every node and its round trip and share the experts so all "
                         "finish a layer together, dropping workers that would only slow it down; "
                         "ram: split by RAM budget only")
+    p.add_argument("--ssd", choices=["off", "distributed", "replicated"], default="off",
+                   help="let workers compute experts from their SSD, not only from RAM: "
+                        "distributed = each expert on one worker's SSD (the cluster's SSDs hold the "
+                        "model together, hottest experts in each worker's RAM); replicated = every "
+                        "worker keeps every expert its --disk fits, so a failed worker's experts move "
+                        "to another worker. off (default) = RAM only")
     p.add_argument("--heat", default=None,
                    help="routing statistics file: read to place hot experts first, updated after a run. "
                         "Default: what serve saved from real traffic, else what probe --topic measured, "
@@ -94,7 +100,8 @@ def build_model(args):
                                      local_budget=budget, heat=heat,
                                      fmt=args.expert_format, wire=args.wire,
                                      replicate=not args.no_replicate, lru_size=args.lru,
-                                     progress=print, placement=args.placement, **_gpu_kw(args))
+                                     progress=print, placement=args.placement, ssd=args.ssd,
+                                     **_gpu_kw(args))
         model = MoEModel(args.model, backend=backend, dense_format=args.dense_format)
     model.placed_by = (heat, source)
     return model
@@ -107,7 +114,7 @@ def cmd_worker(args) -> None:
     serve(host=args.host, port=args.port, budget=parse_size(args.budget, None) if args.budget else None,
           cache_root=args.cache, model_dir=args.model, node_id=args.name,
           advertise=not args.no_advertise, lru_size=args.lru, threads=args.threads,
-          **_gpu_kw(args))
+          disk_budget=parse_size(args.disk, None) if args.disk else None, **_gpu_kw(args))
 
 
 def cmd_discover(args) -> None:
@@ -314,6 +321,9 @@ def main(argv=None) -> None:
     p.add_argument("--port", type=int, default=9100)
     p.add_argument("--budget", default=None, help="RAM for experts, e.g. 12G (default 60%% of RAM)")
     p.add_argument("--cache", default=None, help="expert cache dir (default ~/.moelan/cache)")
+    p.add_argument("--disk", default=None,
+                   help="SSD space for experts the coordinator pushes, e.g. 200G (default: half the "
+                        "free space on the cache's drive); used by the coordinator's --ssd modes")
     p.add_argument("--model", default=None, help="optional local copy of the checkpoint (skips transfer)")
     p.add_argument("--name", default=None, help="node id (default hostname:port)")
     p.add_argument("--no-advertise", action="store_true", help="do not broadcast discovery beacons")

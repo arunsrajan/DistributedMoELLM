@@ -23,6 +23,14 @@ clearly faster gets no experts at all.
 GPUs hold few experts, so which ones matters: the nodes in ``fast`` take each
 layer's hottest experts first, then the rest are split by count, which stays
 fair when the routing counts turn out not to match the traffic.
+
+With the coordinator's SSD modes a worker's capacity is what its SSD holds,
+not its RAM (it keeps the hottest of its experts in RAM and computes the rest
+from the SSD). ``distributed`` places each expert on one worker, as above;
+``replicated`` then gives every worker a copy of all the other experts too, as
+far as its SSD allows (:func:`add_ssd_copies`), so any of them can serve any
+expert and a failed worker's experts move to another worker, not the
+coordinator.
 """
 
 from __future__ import annotations
@@ -50,16 +58,38 @@ class Plan:
     owners: dict[ExpertKey, list[str]]          # expert -> node ids (primary first)
     per_node: dict[str, list[ExpertKey]]
     unplaced: list[ExpertKey]                     # coordinator streams these from disk
+    held: dict[str, list[ExpertKey]] = field(default_factory=dict)   # replicated: other nodes' experts on the SSD
 
     def summary(self, expert_bytes: int) -> str:
         lines = []
         for nid, keys in sorted(self.per_node.items()):
-            lines.append(f"  {nid:<28} {len(keys):6d} experts  {len(keys) * expert_bytes / 2**30:7.2f} GiB")
+            copies = f"  + {len(self.held[nid])} copies on its SSD" if self.held.get(nid) else ""
+            lines.append(f"  {nid:<28} {len(keys):6d} experts  {len(keys) * expert_bytes / 2**30:7.2f} GiB"
+                         f"{copies}")
         if self.unplaced:
             lines.append(f"  {'(disk on coordinator)':<28} {len(self.unplaced):6d} experts")
         replicas = sum(1 for o in self.owners.values() if len(o) > 1)
         lines.append(f"  replicated experts: {replicas}")
         return "\n".join(lines)
+
+
+def add_ssd_copies(plan: Plan, layers: list[int], num_experts: int, caps: dict[str, int],
+                   heat: dict[ExpertKey, float] | None = None) -> Plan:
+    """Replicated SSD mode: besides its own experts, each node in ``caps``
+    (node id -> experts its SSD holds) keeps copies of the others, hottest
+    first, until its SSD is full. They go into ``plan.held`` and, after the
+    primary, into ``plan.owners``."""
+    heat = heat or {}
+    order = sorted(((l, e) for l in layers for e in range(num_experts)),
+                   key=lambda k: (-heat.get(k, 0.0), k[0], k[1]))
+    for nid, cap in caps.items():
+        own = set(plan.per_node.get(nid, []))
+        room = max(0, cap - len(own))
+        extra = [k for k in order if k not in own][:room]
+        plan.held[nid] = extra
+        for k in extra:
+            plan.owners.setdefault(k, []).append(nid)
+    return plan
 
 
 def node_ms(cpu_ms: float, gpu_ms: float | None = None, gpu_experts: int = 0,

@@ -156,6 +156,7 @@ def model_info(model: MoEModel, name: str) -> dict:
             "expert_format": getattr(b, "fmt", None) or (store.fmt if store else None),
             "dense_format": getattr(model, "dense_format", "f32"),
             "backend": "distributed" if hasattr(b, "conns") else "local",
+            "ssd": getattr(b, "ssd", None),
             "kernels": "numba" if kernels.ENABLED else "numpy"}
 
 
