@@ -21,6 +21,9 @@ WHY_DISABLED = ""
 MAX_ROWS = 1 << 30  # all sizes go through the kernels
 ROW_DECODE_FROM = 4  # from this many input rows, decode each weight row once
 BLAS_FROM = 8        # from this many rows (prompt reading), widen the matrix once and use BLAS
+# One compiled call per MoE layer for the experts few rows picked (generating):
+# MOELAN_FUSED=0 goes back to one call per matrix, for comparing.
+FUSED = os.environ.get("MOELAN_FUSED", "1") != "0"
 
 if os.environ.get("MOELAN_KERNELS", "1") != "0":
     try:
@@ -664,6 +667,127 @@ if ENABLED:
         # single-threaded: called from the expert thread pool (not re-entrant otherwise)
         for o in range(raw.shape[0]):
             _gguf_row(raw[o], qtype, out[o])
+
+
+if ENABLED:
+    from numba import carray
+    from numba.core import cgutils, types
+    from numba.extending import intrinsic
+
+    @intrinsic
+    def _at(typingctx, addr):
+        """The int64 address of an array's first byte, as a pointer (for carray)."""
+        def codegen(context, builder, signature, args):
+            return builder.inttoptr(args[0], cgutils.voidptr_t)
+        return types.voidptr(types.int64), codegen
+
+    @njit(parallel=True, fastmath=True, cache=True, nogil=True)
+    def _moe_q4(xe, xo, xsum, ptrs, xors, poff, prow, pw, H, I, gs, out):
+        # One MoE layer's colibri int4 experts, each for a few rows: gate+up,
+        # SiLU, down and the weighted sum, in two parallel sweeps over every
+        # output row of every expert. ptrs[e] holds the addresses of expert e's
+        # (gate|up bytes, their scales, down bytes, their scales); pairs
+        # poff[e]..poff[e+1] are its (input row prow[p], gate weight pw[p]).
+        # Nibbles are read unsigned (u = v + 8) as in _q4, and 8 * sum_g s * sum(x in g)
+        # is taken off afterwards.
+        k = ptrs.shape[0]
+        P = prow.shape[0]
+        O1, C1, G1 = 2 * I, H // 2, H // gs
+        C2, G2 = I // 2, I // gs
+        half = gs // 2
+        h = np.empty((P, O1), np.float32)
+        for t in prange(k * O1):
+            e = t // O1
+            o = t - e * O1
+            raw = carray(_at(ptrs[e, 0]), (O1, C1), np.uint8)
+            sc = carray(_at(ptrs[e, 1]), (O1, G1), np.float32)
+            xr = xors[e]
+            for p in range(poff[e], poff[e + 1]):
+                r = prow[p]
+                acc = np.float32(0.0)
+                corr = np.float32(0.0)
+                for g in range(G1):
+                    part = np.float32(0.0)
+                    b0 = g * half
+                    for j in range(half):
+                        b = np.int32(raw[o, b0 + j] ^ xr)
+                        part += np.float32(b & np.int32(15)) * xe[r, b0 + j] + np.float32(b >> np.int32(4)) * xo[r, b0 + j]
+                    acc += part * sc[o, g]
+                    corr += sc[o, g] * xsum[r, g]
+                h[p, o] = acc - np.float32(8.0) * corr
+        ae = np.empty((P, C2), np.float32)
+        ao = np.empty((P, C2), np.float32)
+        asum = np.empty((P, G2), np.float32)
+        for p in prange(P):
+            for j in range(C2):
+                g0, g1 = h[p, 2 * j], h[p, 2 * j + 1]
+                ae[p, j] = g0 / (np.float32(1.0) + np.exp(-g0)) * h[p, I + 2 * j]
+                ao[p, j] = g1 / (np.float32(1.0) + np.exp(-g1)) * h[p, I + 2 * j + 1]
+            for g in range(G2):
+                acc = np.float32(0.0)
+                for j in range(g * half, (g + 1) * half):
+                    acc += ae[p, j] + ao[p, j]
+                asum[p, g] = acc
+        y = np.empty((P, H), np.float32)
+        for t in prange(k * H):
+            e = t // H
+            o = t - e * H
+            raw = carray(_at(ptrs[e, 2]), (H, C2), np.uint8)
+            sc = carray(_at(ptrs[e, 3]), (H, G2), np.float32)
+            xr = xors[e]
+            for p in range(poff[e], poff[e + 1]):
+                acc = np.float32(0.0)
+                corr = np.float32(0.0)
+                for g in range(G2):
+                    part = np.float32(0.0)
+                    b0 = g * half
+                    for j in range(half):
+                        b = np.int32(raw[o, b0 + j] ^ xr)
+                        part += np.float32(b & np.int32(15)) * ae[p, b0 + j] + np.float32(b >> np.int32(4)) * ao[p, b0 + j]
+                    acc += part * sc[o, g]
+                    corr += sc[o, g] * asum[p, g]
+                y[p, o] = acc - np.float32(8.0) * corr
+        for p in range(P):       # a row picks an expert once, but several experts: add in turn
+            r = prow[p]
+            w = pw[p]
+            for j in range(H):
+                out[r, j] += w * y[p, j]
+
+
+def _addr(a: np.ndarray) -> int:
+    return a.__array_interface__["data"][0]
+
+
+def q4_expert_ptrs(e) -> tuple[int, int, int, int, int] | None:
+    """What :func:`moe_q4` needs of one int4 expert (addresses of its four
+    arrays and the XOR for its nibbles), or None if it does not qualify."""
+    gu, dn = e.gu, e.down
+    for m in (gu, dn):
+        if not (m.raw.flags.c_contiguous and m.s.flags.c_contiguous and m.raw.dtype == np.uint8
+                and m.s.dtype == np.float32):
+            return None
+    if gu.gs != dn.gs or gu.offset != dn.offset:
+        return None
+    return _addr(gu.raw), _addr(gu.s), _addr(dn.raw), _addr(dn.s), 0 if gu.offset else 0x88
+
+
+def moe_q4(x: np.ndarray, items, H: int, I: int, gs: int, out: np.ndarray) -> None:
+    """Add ``sum_e w * expert_e(x[rows])`` into ``out`` for colibri int4
+    experts in one call. ``items``: (ptrs from :func:`q4_expert_ptrs`, rows,
+    gate weights) per expert; the arrays behind the pointers must stay alive."""
+    rows = np.concatenate([r for _, r, _ in items]).astype(np.int64, copy=False)
+    uniq, prow = np.unique(rows, return_inverse=True)
+    xs = np.ascontiguousarray(x[uniq], np.float32)
+    xe, xo = np.ascontiguousarray(xs[:, 0::2]), np.ascontiguousarray(xs[:, 1::2])
+    xsum = xs.reshape(xs.shape[0], -1, gs).sum(2)
+    ptrs = np.array([p[:4] for p, _, _ in items], np.int64)
+    xors = np.array([p[4] for p, _, _ in items], np.uint8)
+    poff = np.zeros(len(items) + 1, np.int64)
+    np.cumsum([len(r) for _, r, _ in items], out=poff[1:])
+    pw = np.concatenate([w for _, _, w in items]).astype(np.float32, copy=False)
+    part = np.zeros((len(uniq), H), np.float32)
+    _moe_q4(xe, xo, xsum, ptrs, xors, poff, prow.astype(np.int64), pw, H, I, gs, part)
+    out[uniq] += part
 
 
 def q4_dequant(raw, s, gs: int, offset: bool, out: np.ndarray) -> np.ndarray:

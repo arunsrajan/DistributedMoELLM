@@ -246,10 +246,11 @@ class QuantMatrix(GroupQuant):
 class Expert:
     """A SwiGLU expert with gate and up fused into one (2*inter, hidden) matrix."""
 
-    __slots__ = ("gu", "down", "inter")
+    __slots__ = ("gu", "down", "inter", "fused")
 
     def __init__(self, gu, down, inter: int):
         self.gu, self.down, self.inter = gu, down, inter
+        self.fused = None   # its arrays' addresses for kernels.moe_q4 (False: not that kind)
 
     def __call__(self, x: np.ndarray) -> np.ndarray:
         h = self.gu.matmul_t(x)
@@ -349,6 +350,26 @@ def bench_expert(hidden: int, inter: int, fmt: str, gs: int = 64, reps: int = 48
     experts = [synthetic_expert(hidden, inter, fmt, gs, rng)
                for _ in range(max(2, min(12, int(48 * 2**20 // one) + 1)))]
     x = (rng.standard_normal((1, hidden)) * 0.1).astype(np.float32)
+    gsx = experts[0].gu.gs if isinstance(experts[0].gu, Packed4) else 0
+    if fmt == "int4" and kernels.ENABLED and kernels.FUSED and gsx and hidden % gsx == 0 and inter % gsx == 0:
+        # generating runs a layer's int4 experts in one call: time them that way
+        ptrs = [kernels.q4_expert_ptrs(e) for e in experts]
+        row, w, out = np.array([0]), np.array([1.0], np.float32), np.zeros_like(x)
+        k = min(8, len(experts))
+
+        def layer(i):
+            items = [(ptrs[(i * k + j) % len(experts)], row, w) for j in range(k)]
+            kernels.moe_q4(x, items, hidden, inter, gsx, out)
+        for i in range(len(experts)):
+            layer(i)
+        calls = max(1, reps // k)
+        rounds = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            for i in range(calls):
+                layer(i)
+            rounds.append((time.perf_counter() - t0) / (calls * k) * 1000)
+        return float(np.median(rounds))
     for e in experts:
         e(x)
     rounds = []
@@ -648,15 +669,44 @@ class ExpertStore:
         # With the kernels: experts with many rows (prompt reading) are widened
         # by a single-threaded kernel and multiplied by BLAS, several at once on
         # threads; the rest use the parallel kernels, which are not re-entrant,
-        # so they run one after another afterwards.
+        # so they run one after another afterwards: int4 experts with a few
+        # rows each (generating) all in one call for the layer.
         big = [g for g in groups if len(g[1]) >= kernels.BLAS_FROM]
         small = [g for g in groups if len(g[1]) < kernels.BLAS_FROM]
         if big:
             it = self._pool.map(one, big) if self._pool and len(big) > 1 else map(one, big)
             for rows, y in it:
                 out[rows] += y
+        if small and kernels.FUSED and self.fmt == "int4":
+            small = self._compute_fused(layer, x, small, out)
         for rows, y in map(one, small):
             out[rows] += y
+
+    def _compute_fused(self, layer, x, groups, out) -> list:
+        """Run the int4 experts among ``groups`` in one kernel call; returns the
+        groups it did not take."""
+        # ``keep`` holds every expert until the call returns: the kernel reads
+        # them by address, and the bounded map cache could drop one meanwhile
+        items, rest, keep, shape = [], [], [], None
+        for g in groups:
+            expert, rows, weights = g
+            if len(rows) >= kernels.ROW_DECODE_FROM:
+                rest.append(g)
+                continue
+            e = self.get((layer, int(expert)))
+            if e.fused is None:
+                ok = isinstance(e.gu, Packed4) and isinstance(e.down, Packed4)
+                e.fused = (kernels.q4_expert_ptrs(e) if ok else None) or False
+            dims = (e.gu.shape[1], e.inter, e.gu.gs) if e.fused else None
+            if e.fused is False or (shape is not None and dims != shape):
+                out[rows] += e(x[rows]) * weights[:, None]     # fetched already: compute it here
+                continue
+            shape = dims
+            keep.append(e)
+            items.append((e.fused, rows, weights))
+        if items:
+            kernels.moe_q4(x, items, *shape, out)
+        return rest
 
     def setup_gpu(self, spec: str, budget: int, candidates, heat=None, mode: str = "auto",
                   progress=None) -> dict:

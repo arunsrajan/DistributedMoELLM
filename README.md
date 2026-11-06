@@ -277,8 +277,10 @@ Laptop: Ryzen 5 5500U (6 cores / 12 threads), 32 GB, Wi-Fi. Decode, greedy,
 | first version (numpy; a float64 promotion bug) | 0.04 |
 | pure numpy, no numba | 0.25-0.30 |
 | numba kernels, f32 attention/head (previous default) | 2.1-2.4 |
-| **numba kernels, attention/head as stored 16-bit (default, exact)** | **3.1-3.3** |
-| **numba kernels, `--dense-format int8`** | **3.5-3.9** |
+| numba kernels, attention/head as stored 16-bit (exact) | 3.1-3.3 |
+| numba kernels, `--dense-format int8` | 3.5-3.9 |
+| **+ one compiled call per MoE layer for the experts, 16-bit (default, exact)** | **4.0** |
+| **+ one compiled call per MoE layer, `--dense-format int8`** | **4.8** |
 | coordinator + 1 worker process, same laptop | 2.5 |
 | coordinator + 2 worker processes, same laptop | 3.0 |
 | colibri (C/SIMD) on a similar CPU, its README | 8.5-13 |
@@ -288,10 +290,23 @@ RAM. The 15 GB of experts are read through that cache, so on a 32 GB machine
 another large process (a second moelan server, a browser with many tabs)
 pushes experts out to disk and speed can halve.
 
-Where one token's ~0.3 s goes on one machine: routed experts about 0.17 s (384
-expert evaluations, numba's int4 kernels at roughly 8-12 GB/s), attention +
-output head about 0.13 s as 16-bit or 0.09 s as int8. Loopback round
-trip 0.08 ms; the full per-layer request/reply overhead is about 0.4 ms.
+Where one token's time goes on one machine, with `--dense-format int8`
+(measured, 48 tokens): routed experts 0.11 s, attention and the output head
+0.08 s, norms and the rest 0.02 s. The experts used to take 0.20 s: each of the
+384 expert evaluations per token was its own kernel call plus Python around
+it, and less than half of that time was the kernel. Now the int4 experts a
+layer picks for its few rows (generating; prompts keep their BLAS path) go
+through one compiled call: gate and up, SiLU, down and the weighted sum, for
+all of them, reading the weights in place. The kernel then reads about 11 GB/s
+of weights out of the 40 GB/s this laptop's RAM gives, and the arithmetic of
+unpacking 4-bit values is the limit now, not Python. Same machine, same text,
+`run` with 64 tokens: 3.3 -> 4.0 tok/s with 16-bit attention, 3.9 -> 4.8
+tok/s with int8. `MOELAN_FUSED=0` goes back to one call per expert, for
+comparing. Workers use the same call, and speed placement measures nodes
+with it.
+
+Loopback round trip 0.08 ms; the full per-layer request/reply overhead is
+about 0.4 ms.
 
 **Does the LAN make it faster?** The workers on one laptop share the same six
 cores, so that test cannot show a speedup, only correctness and overhead.
@@ -299,14 +314,15 @@ With separate machines, decode time per token is roughly
 
     dense (coordinator)  +  experts / N machines  +  48 layers x (RTT + 0.3 ms)
 
-| N identical laptops | wired gigabit (RTT ~0.3 ms) | Wi-Fi (RTT ~3 ms) |
+| N identical laptops, `--dense-format int8` | wired gigabit (RTT ~0.3 ms) | Wi-Fi (RTT ~3 ms) |
 |---|---|---|
-| 1 | 3.8 tok/s | 3.8 tok/s |
-| 2 | about 4.9 tok/s | about 3.0 tok/s |
-| 4 | about 6.2 tok/s | about 3.4 tok/s |
+| 1 | 4.8 tok/s | 4.8 tok/s |
+| 2 | about 5.4 tok/s | about 3.2 tok/s |
+| 4 | about 6.4 tok/s | about 3.5 tok/s |
 
-These are estimates from the measured parts, not measurements. The ceiling is
-the coordinator's dense part (~11 tok/s). So: on wired Ethernet more machines
+These are estimates from the measured parts (experts 0.11 s, the rest 0.10 s
+per token), not measurements. The ceiling is the coordinator's dense part
+(~10 tok/s). So: on wired Ethernet more machines
 help moderately; on Wi-Fi the 48 round trips per token eat the gain. The
 reliable win is capacity: a model whose experts do not fit in one machine's
 RAM (Qwen3-235B-A22B, ~120 GB int4) runs from RAM across several machines
