@@ -513,7 +513,8 @@ per-64 scales kept the output identical in every test, as did f16.
 4). Each step runs every running conversation's next token through the
 weights in one pass, and each MoE layer is one request per worker for the
 whole batch, so the 48 round trips per step are shared. New requests join
-between steps; a long prompt being read delays the others by that prefill.
+between steps. While a long prompt is read, the running conversations keep
+generating between its layers (see *Coding agents* below).
 
 Measured on the same laptop, Qwen3-Coder-30B, one machine:
 
@@ -582,6 +583,28 @@ specially:
   `--prompt-cache-disk 8G`, `--prompt-cache-dir`). The next turn reuses the
   conversation so far; long prompts are also written to disk (0.2 MB per token
   for Qwen3-30B) and found again after a restart.
+  * A conversation longer than `--prompt-cache-tokens` keeps its first
+    `--prompt-cache-tokens` tokens in memory and goes to disk whole. The next
+    agent step can use it while it is still being written.
+  * Before this, a conversation over the limit was not kept at all. An agent
+    whose prompt had reached 18,169 tokens read all of it again at every step,
+    about 20 minutes each on a two-laptop cluster.
+  * An agent's conversation keeps growing, so give the disk room: a 40k-token
+    conversation needs 8 GB (`--prompt-cache-disk 20G`). One that does not fit
+    is logged and keeps only its start in memory.
+* **Other requests keep going.** Between two layers of a long prompt (about
+  11 s each for an 8k-token pass here), the running conversations generate for
+  about as long as the prompt took since they last ran. Requests that arrive
+  meanwhile are admitted and their prompts read at once, so a short request is
+  answered in seconds, not after the long prompt.
+  * Before, a chat got no tokens at all for the 20 minutes an 18,169-token
+    agent prompt took to read.
+  * The prompt still gets at least half the machine, and all of it once the
+    others finish.
+  * Passes stay 8192 tokens, because smaller ones cost much more per prompt
+    token: each pass unpacks every expert it touches to f32 once. Measured on
+    Qwen3-30B experts, a 1,024-token pass costs 3.2x the expert time per token
+    of an 8,192-token pass, and a 2,048-token pass 1.9x.
 
 Measured on Qwen3-Coder-30B, a 3,200-token agent-style system prompt, streaming:
 

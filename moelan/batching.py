@@ -7,13 +7,15 @@ that step is one request per worker per MoE layer for the whole batch, so the
 48 network round trips per step are shared by all running requests, and an
 expert that several requests picked decodes its weights once for all of them.
 
-Requests join and leave between steps; a long prompt being read delays the
-other requests' next token by that prefill.
+Requests join and leave between steps. A long prompt (an agent's runs to 10k+
+tokens and takes many minutes to read on a CPU) does not hold the others up:
+between its layers the running requests get about as much time to generate
+as the prompt took since they last ran, and new requests are admitted.
 
 A prompt cache keeps the KV caches of recent conversations. A new prompt that
 starts like one of them (the same system prompt and tool list, or the next
 turn of the same chat) copies the shared part and only reads the rest, which
-matters for agents whose tool definitions run to hundreds of tokens.
+matters for agents: each of their steps sends the whole conversation again.
 """
 
 from __future__ import annotations
@@ -78,11 +80,12 @@ class PromptCache:
     """KV caches of finished conversations, keyed by the tokens they hold.
 
     In memory, least recently used entries go first once ``max_tokens`` is
-    exceeded. With ``disk_dir``, long entries (``disk_min`` tokens and up, such
-    as a coding agent's system prompt) are also written to disk in the
-    background and found again after a restart, so a prompt that takes minutes
-    to read is read once, not once per server start. Disk use is capped at
-    ``disk_max_bytes``, oldest entries deleted first."""
+    exceeded; a longer conversation keeps its first ``max_tokens`` there. With
+    ``disk_dir``, long entries (``disk_min`` tokens and up, such as a coding
+    agent's system prompt) are also written to disk in the background, whole
+    however long, and found again after a restart, so a prompt that takes
+    minutes to read is read once, not once per agent step or server start.
+    Disk use is capped at ``disk_max_bytes``, oldest entries deleted first."""
 
     def __init__(self, max_tokens: int = 16384, min_match: int = 8, disk_dir=None,
                  disk_max_bytes: int = 0, new_cache=None, disk_min: int = 512):
@@ -99,6 +102,7 @@ class PromptCache:
         self.disk_max = disk_max_bytes
         self.disk_dir = Path(disk_dir) if disk_dir and disk_max_bytes > 0 and new_cache else None
         self.disk: list[tuple[np.ndarray, Path]] = []
+        self.writing: list[tuple[np.ndarray, object]] = []   # entries on their way to disk
         self._writer = None
         if self.disk_dir is not None:
             self.disk_dir.mkdir(parents=True, exist_ok=True)
@@ -127,6 +131,10 @@ class PromptCache:
                 common = self._common(a, toks, len(a) - 1)
                 if common > best_len:
                     best, best_len, where = i, common, "mem"
+            for i, (toks, _) in enumerate(self.writing):    # the next agent step comes quickly
+                common = self._common(a, toks, len(a) - 1)
+                if common > best_len:
+                    best, best_len, where = i, common, "writing"
             for i, (toks, _) in enumerate(self.disk):
                 common = self._common(a, toks, len(a) - 1)
                 if common > best_len:
@@ -137,6 +145,8 @@ class PromptCache:
                 entry = self.entries.pop(best)
                 self.entries.append(entry)
                 cache = entry[1].clone(best_len)
+            elif where == "writing":
+                cache = self.writing[best][1].clone(best_len)
             else:
                 cache = self._load(self.disk[best][1], best_len)
                 if cache is None:
@@ -148,21 +158,37 @@ class PromptCache:
             return cache, best_len
 
     def store(self, tokens, cache) -> None:
+        """Keep ``cache``, the KV cache of ``tokens``, for prompts that start the
+        same way. Memory takes the longest start that fits in ``max_tokens``; the
+        disk takes the whole conversation, and until it is written, lookups copy
+        from ``cache`` itself, so the caller must not change it afterwards."""
         if self.max_tokens <= 0:
             return
         toks = np.asarray(tokens, dtype=np.int64)[:cache.length]
-        if len(toks) < self.min_match or len(toks) > self.max_tokens:
+        if len(toks) < self.min_match:
             return
-        compact = cache.clone(len(toks))
+        mem = toks[:self.max_tokens]
+        compact = None
+        if len(mem) >= self.min_match:
+            compact = cache.clone(len(mem))
+            with self.lock:
+                # an entry that is a prefix of the new one is now redundant
+                self.entries = [(t, c) for t, c in self.entries
+                                if not (len(t) <= len(mem) and np.array_equal(mem[:len(t)], t))]
+                self.entries.append((mem, compact))
+                while sum(len(t) for t, _ in self.entries) > self.max_tokens:
+                    self.entries.pop(0)
+        if self._writer is None or len(toks) < self.disk_min:
+            return
+        need = len(toks) * sum(a.shape[0] * a.shape[2] * a.itemsize for a in (*cache.k, *cache.v))
+        if need > self.disk_max:
+            log.info("prompt cache: a %d-token conversation needs %.1f GiB, more than --prompt-cache-disk "
+                     "allows; not kept on disk", len(toks), need / 2**30)
+            return
+        src = compact if compact is not None and len(mem) == len(toks) else cache
         with self.lock:
-            # an entry that is a prefix of the new one is now redundant
-            self.entries = [(t, c) for t, c in self.entries
-                            if not (len(t) <= len(toks) and np.array_equal(toks[:len(t)], t))]
-            self.entries.append((toks, compact))
-            while sum(len(t) for t, _ in self.entries) > self.max_tokens:
-                self.entries.pop(0)
-        if self._writer is not None and len(toks) >= self.disk_min:
-            self._writer.submit(self._save, toks, compact)
+            self.writing.append((toks, src))
+        self._writer.submit(self._save, toks, src)
 
     # ---- disk -----------------------------------------------------------
     def _save(self, toks: np.ndarray, cache) -> None:
@@ -194,6 +220,9 @@ class PromptCache:
                     shutil.rmtree(self.disk.pop(0)[1], ignore_errors=True)
         except OSError:
             log.exception("could not write the prompt cache to disk")
+        finally:
+            with self.lock:
+                self.writing = [e for e in self.writing if e[1] is not cache]
 
     def _disk_bytes(self) -> int:
         return sum(f.stat().st_size for _, d in self.disk for f in d.glob("*.npy") if f.exists())
@@ -222,6 +251,10 @@ class PromptCache:
 
 
 class Batcher(threading.Thread):
+    # Reading a prompt for this long lets the running requests generate (for as
+    # long again) and admits new ones, between two of its layers.
+    SLICE_S = 1.0
+
     def __init__(self, model: MoEModel, telemetry=None, max_batch: int = 4,
                  prompt_cache_tokens: int = 16384, prompt_cache_dir=None,
                  prompt_cache_disk: int = 0):
@@ -231,6 +264,7 @@ class Batcher(threading.Thread):
         self.max_batch = max(1, int(max_batch))
         self.pending: queue.Queue = queue.Queue()
         self.running: list[GenRequest] = []
+        self.reading: list[GenRequest] = []   # prompts being read
         self.steps = 0
         self.batch_sizes = 0  # sum over steps, for the average batch size
         disk = None
@@ -288,6 +322,13 @@ class Batcher(threading.Thread):
             self.running = []
 
     def _prefill(self, reqs: list[GenRequest]) -> None:
+        self.reading += reqs
+        try:
+            self._read(reqs)
+        finally:
+            self.reading = [r for r in self.reading if r not in reqs]
+
+    def _read(self, reqs: list[GenRequest]) -> None:
         todo = []
         for r in reqs:
             cache, hit = self.pcache.lookup(r.ids)
@@ -301,9 +342,21 @@ class Batcher(threading.Thread):
             if self.tel:
                 for r, d in zip(reqs, done):
                     self.tel.progress(r.rid, r.cached + d)
+        since = [time.perf_counter()]
+
+        def pause():   # between two layers of these prompts
+            took = time.perf_counter() - since[0]
+            if took < self.SLICE_S:
+                return
+            self._admit_meanwhile()
+            end = time.perf_counter() + took
+            while self.running and time.perf_counter() < end:
+                self._decode(self.running)
+                self.running = [r for r in self.running if not r.done]
+            since[0] = time.perf_counter()
         try:
             logits = self.model.forward_batch(
-                todo, [r.cache for r in reqs], on_progress=progress,
+                todo, [r.cache for r in reqs], on_progress=progress, pause=pause,
                 should_stop=lambda: all(r.cancelled for r in reqs))   # checked after every layer
         except Interrupted:
             # Every client went away. Keep the passes already read: a client
@@ -316,6 +369,31 @@ class Batcher(threading.Thread):
             return
         for r, lg in zip(reqs, logits):
             self._emit(r, lg)
+
+    def _admit_meanwhile(self) -> None:
+        """While a prompt is read: admit waiting requests that fit in the batch
+        and read their prompts now (a short one is done in seconds, then
+        generates in the following pauses), instead of after the long one."""
+        new = []
+        while len(self.running) + len(self.reading) + len(new) < self.max_batch:
+            try:
+                r = self.pending.get_nowait()
+            except queue.Empty:
+                break
+            if r.cancelled:
+                self._finish(r)
+            else:
+                new.append(r)
+        if not new:
+            return
+        try:
+            self._prefill(new)
+        except Exception as exc:   # the caller's step fails too; these are not in its lists
+            for r in new:
+                if not r.done:
+                    self._finish(r, exc)
+            raise
+        self.running += [r for r in new if not r.done]
 
     def _decode(self, reqs: list[GenRequest]) -> None:
         live = [r for r in reqs if not r.done]

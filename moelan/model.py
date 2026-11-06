@@ -585,7 +585,8 @@ class MoEModel:
 
     PREFILL_CHUNK = 8192   # rows per pass when reading long prompts (attention is blocked anyway)
 
-    def forward_batch(self, token_lists, caches, on_progress=None, should_stop=None) -> np.ndarray:
+    def forward_batch(self, token_lists, caches, on_progress=None, should_stop=None,
+                      pause=None) -> np.ndarray:
         """Advance several sequences at once, each by its own tokens and with its
         own KV cache; returns the last-position logits of each, (B, vocab).
 
@@ -599,9 +600,12 @@ class MoEModel:
         small; ``on_progress(done)`` gets each sequence's tokens read so far,
         after every layer (partly read passes count in proportion), and
         ``should_stop()``, also checked after every layer, aborts the call with
-        :class:`Interrupted`; the caches then hold every completed pass."""
+        :class:`Interrupted`; the caches then hold every completed pass.
+        ``pause()``, called after every layer as well, may run other forward
+        calls on other caches meanwhile (the server lets generating requests
+        advance between the layers of a long prompt); the pass then carries on."""
         token_lists = [list(t) for t in token_lists]
-        if sum(len(t) for t in token_lists) <= self.PREFILL_CHUNK and not (on_progress or should_stop):
+        if sum(len(t) for t in token_lists) <= self.PREFILL_CHUNK and not (on_progress or should_stop or pause):
             return self._forward_pass(token_lists, caches)
         for toks, cache in zip(token_lists, caches):
             cache.reserve(cache.length + len(toks))      # one allocation, not one per pass
@@ -618,6 +622,8 @@ class MoEModel:
                     for i, c in zip(live, chunks):
                         part[i] += int(len(c) * frac)
                     on_progress(part)
+                if pause:
+                    pause()
                 if should_stop and should_stop():
                     raise Interrupted()
             out = self._forward_pass(chunks, [caches[i] for i in live], after_layer)

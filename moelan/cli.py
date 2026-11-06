@@ -374,12 +374,14 @@ def main(argv=None) -> None:
     p.add_argument("--max-batch", type=int, default=4,
                    help="requests decoded together (1 = one at a time)")
     p.add_argument("--prompt-cache-tokens", type=int, default=16384,
-                   help="tokens of recent conversations kept to reuse shared prompt starts "
-                        "(about 0.2 MB each for Qwen3-30B; 0 = off)")
+                   help="tokens of recent conversations kept in memory to reuse shared prompt starts "
+                        "(about 0.2 MB each for Qwen3-30B; a longer conversation keeps its start here "
+                        "and goes to disk whole; 0 = off)")
     p.add_argument("--prompt-cache-dir", default=None,
                    help="where long prompt caches are kept across restarts (default ~/.moelan/kvcache)")
     p.add_argument("--prompt-cache-disk", default="8G",
-                   help="disk space for them, e.g. 20G (0 = memory only)")
+                   help="disk space for them, e.g. 20G (a 40k-token agent conversation takes 8 GB "
+                        "for Qwen3-30B; 0 = memory only)")
     p.add_argument("--expert-tokens", action="store_true",
                    help="count which tokens reach each expert, for the dashboard's tooltip. Fragments of "
                         "real prompts become visible to anyone who can open the dashboard")
