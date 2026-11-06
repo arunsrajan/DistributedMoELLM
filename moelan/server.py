@@ -158,7 +158,8 @@ def model_info(model: MoEModel, name: str) -> dict:
             "dense_format": getattr(model, "dense_format", "f32"),
             "backend": "distributed" if hasattr(b, "conns") else "local",
             "ssd": getattr(b, "ssd", None),
-            "kernels": "numba" if kernels.ENABLED else "numpy"}
+            "kernels": "numba" if kernels.ENABLED else "numpy",
+            "prompt_gpu": model.prompt_gpu.stats() if getattr(model, "prompt_gpu", None) else None}
 
 
 def node_stats(model: MoEModel) -> list[dict]:

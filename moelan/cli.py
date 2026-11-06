@@ -13,7 +13,8 @@ from . import __version__
 
 def _add_gpu_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gpu", choices=["none", "auto", "cuda", "mps", "dml", "torch-cpu"], default="none",
-                   help="hybrid mode: also compute experts on this GPU (needs PyTorch; dml = "
+                   help="hybrid mode: also compute experts on this GPU, and on the machine that runs "
+                        "the model (serve, run) read prompts' attention on it (needs PyTorch; dml = "
                         "torch-directml for AMD/Intel GPUs on Windows)")
     p.add_argument("--gpu-budget", default="4G", help="GPU memory for experts (fp16), e.g. 6G")
     p.add_argument("--gpu-mode", choices=["auto", "max"], default="auto",
@@ -69,6 +70,10 @@ def _gpu_kw(args) -> dict:
     return {"gpu": args.gpu, "gpu_budget": parse_size(args.gpu_budget, 0), "gpu_mode": args.gpu_mode}
 
 
+def _prompt_gpu(args) -> str | None:
+    return None if args.gpu == "none" else args.gpu
+
+
 def build_model(args):
     from . import kernels
     from .config import load_config
@@ -94,7 +99,7 @@ def build_model(args):
               f"({'hottest pinned in RAM, ' if budget else ''}the rest computed from the memory-mapped checkpoint)")
         model = MoEModel(args.model, lru_size=args.lru, expert_format=args.expert_format,
                          pin_budget=budget, heat=heat, progress=print,
-                         dense_format=args.dense_format, **_gpu_kw(args))
+                         dense_format=args.dense_format, prompt_gpu=_prompt_gpu(args), **_gpu_kw(args))
     else:
         backend = DistributedBackend(args.model, cfg, workers,
                                      local_budget=budget, heat=heat,
@@ -102,7 +107,8 @@ def build_model(args):
                                      replicate=not args.no_replicate, lru_size=args.lru,
                                      progress=print, placement=args.placement, ssd=args.ssd,
                                      **_gpu_kw(args))
-        model = MoEModel(args.model, backend=backend, dense_format=args.dense_format)
+        model = MoEModel(args.model, backend=backend, dense_format=args.dense_format, progress=print,
+                         prompt_gpu=_prompt_gpu(args), gpu_mode=args.gpu_mode)
     model.placed_by = (heat, source)
     return model
 

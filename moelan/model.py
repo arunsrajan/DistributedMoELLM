@@ -368,7 +368,8 @@ class MoEModel:
     def __init__(self, model_dir: str | Path, backend: ExpertBackend | None = None,
                  lru_size: int = 0, expert_format: str | None = None, pin_budget: int = 0,
                  heat: Counter | None = None, progress=None, dense_format: str = "auto",
-                 gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto"):
+                 gpu: str | None = None, gpu_budget: int = 0, gpu_mode: str = "auto",
+                 prompt_gpu: str | None = None):
         self.model_dir = Path(model_dir)
         self.cfg = cfg = load_config(model_dir)
         gguf = cfg.expert_layout == "gguf"
@@ -479,8 +480,33 @@ class MoEModel:
                                 heat=heat, mode=gpu_mode, progress=progress)
             backend = LocalBackend(store)
         self.backend = backend
+        self.prompt_gpu = self._setup_prompt_gpu(prompt_gpu, gpu_mode, progress) if prompt_gpu else None
         self.on_route = None   # on_route(layer, tokens, expert ids): see topics.py
         self.placed_by = (Counter(), None)   # the routing counts placement used, and their source
+
+    def _setup_prompt_gpu(self, spec: str, mode: str, progress):
+        """A GPU for reading prompts (see accel.PromptGpu), if it is faster at a
+        prompt pass's attention than the CPU (``mode`` max: regardless)."""
+        from .accel import PromptGpu
+        say = progress or (lambda m: None)
+        if self.cfg.attention == "mla":
+            say("prompt reading on the GPU: not for this model's attention (MLA); it stays on the CPU")
+            return None
+        try:
+            pg = PromptGpu(spec)
+        except RuntimeError as exc:
+            say(f"prompt reading on the GPU: {exc}")
+            return None
+        cfg = self.cfg
+        gain = pg.calibrate(cfg.num_heads, cfg.num_kv_heads, cfg.head_dim, _gqa_attention)
+        what = (f"{pg.name}: attention of a 512-row prompt block takes {pg.gpu_ms:.1f} ms vs "
+                f"{pg.cpu_ms:.1f} ms on the CPU")
+        if gain < 1.5 and mode != "max":
+            say(f"{what} -> not used for reading prompts (--gpu-mode max forces it)")
+            return None
+        say(f"{what} ({gain:.1f}x) -> reads prompts (attention and its projections); "
+            "generating stays on the CPU")
+        return pg
 
     def dense_bytes(self) -> int:
         n = self.embed.nbytes + self.norm.nbytes + self.lm_head.nbytes
@@ -535,7 +561,12 @@ class MoEModel:
             return self._mla(L, h, positions, segs, layer)
         n = h.shape[0]
         H, KV, hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
-        q, k, v = _mm(h, L["q"]), _mm(h, L["k"]), _mm(h, L["v"])
+        gpu = self.prompt_gpu if self.prompt_gpu is not None and n >= self.prompt_gpu.ROWS else None
+
+        def mm(x, name):   # a prompt pass: on the GPU when there is one
+            y = gpu.matmul((layer, name), x, L[name]) if gpu is not None else None
+            return _mm(x, L[name]) if y is None else y
+        q, k, v = mm(h, "q"), mm(h, "k"), mm(h, "v")
         if L["qb"] is not None:
             q, k, v = q + L["qb"], k + L["kb"], v + L["vb"]
         qn, kn = L["q_norm"], L["k_norm"]
@@ -554,8 +585,9 @@ class MoEModel:
         for a, b, cache in segs:
             pos = positions[a:b]
             K, V = cache.append(layer, k[a:b].transpose(1, 0, 2), v[a:b].transpose(1, 0, 2), int(pos[0]))
-            _gqa_attention(q[a:b], K, V, pos, out[a:b])
-        o = _mm(out.reshape(n, H * hd), L["o"])
+            if gpu is None or b - a < gpu.ROWS or not gpu.attention(q[a:b], K, V, pos, out[a:b]):
+                _gqa_attention(q[a:b], K, V, pos, out[a:b])
+        o = mm(out.reshape(n, H * hd), "o")
         return o + L["ob"] if L["ob"] is not None else o
 
     def _ffn(self, L, h, layer: int, tokens: np.ndarray) -> np.ndarray:

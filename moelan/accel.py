@@ -248,6 +248,155 @@ class GpuGuard:
                 "layer_ms_cpu_alone": None if c is None else round(c, 3)}
 
 
+class PromptGpu:
+    """Reading prompts on a GPU: the attention of passes with many rows.
+
+    On a CPU most of a long prompt's reading time is attention, which grows
+    with the square of the prompt's length (an 8k-token pass of Qwen3-30B:
+    ~11 s per layer, 78% of it attention and its projections). That is dense
+    matrix work, what a GPU is built for, unlike generating a token (one row
+    per expert: a laptop GPU made those layers slower). So for a pass of at
+    least ``ROWS`` rows the q/k/v/o projections and the score/value step run
+    here; generating stays on the CPU. The projection weights are uploaded
+    once, in fp16, on first use (about 1.8 GB for Qwen3-30B); one that does
+    not fit, or any step that fails, falls back to the CPU."""
+
+    ROWS = 32
+    SCORES = 1 << 25     # score elements per block of query rows (fp32: 128 MB)
+
+    def __init__(self, spec: str):
+        self.torch, self.device, self.name = open_device(spec)
+        self.dtype = self.torch.float32 if spec == "torch-cpu" else self.torch.float16
+        self.weights: dict = {}      # (layer, name) -> (out, in) tensor; None: stays on the CPU
+        self.used = 0
+        self.calls = 0
+        self.busy_s = 0.0
+        self.rows = 0
+        self.gpu_ms = self.cpu_ms = None
+        self.failed = None           # the last error that sent a step back to the CPU
+        self._sdpa = None            # torch's fused attention with a lower-right causal mask, if it has one
+
+    # ---- projections ------------------------------------------------------
+    def matmul(self, key, x: np.ndarray, w):
+        """x @ W.T on the GPU (W uploaded on first use), or None: use the CPU."""
+        t = self.torch
+        dev = self.weights.get(key, ...)
+        if dev is ...:
+            try:
+                a = np.asarray(w, np.float32) if isinstance(w, np.ndarray) else w.dequant()
+                dev = t.as_tensor(np.ascontiguousarray(a, np.float32)).to(self.device, self.dtype)
+                self.used += dev.numel() * dev.element_size()
+            except (RuntimeError, MemoryError, AttributeError) as exc:
+                self.failed, dev = f"{key}: {exc}", None
+            self.weights[key] = dev
+        if dev is None:
+            return None
+        t0 = time.perf_counter()
+        try:
+            with t.no_grad():
+                y = (t.as_tensor(np.ascontiguousarray(x, np.float32)).to(self.device, self.dtype) @ dev.T)
+                y = y.float().cpu().numpy()
+        except RuntimeError as exc:
+            self.failed = f"{key}: {exc}"
+            return None
+        self.busy_s += time.perf_counter() - t0
+        return y
+
+    # ---- the score/value step ------------------------------------------------
+    def attention(self, q: np.ndarray, K: np.ndarray, V: np.ndarray, pos: np.ndarray, out: np.ndarray) -> bool:
+        """Causal grouped-query attention of a prompt pass: query rows ``q``
+        (m, H, hd) at the consecutive positions ``pos``, ending at the last
+        of the keys/values (KV, T, hd); into ``out``. False: use the CPU."""
+        t = self.torch
+        m, H, hd = q.shape
+        KV, T = K.shape[0], int(pos[-1]) + 1
+        if int(pos[0]) != T - m:
+            return False
+        t0 = time.perf_counter()
+        try:
+            with t.no_grad():
+                qd = t.as_tensor(np.ascontiguousarray(q, np.float32)).to(self.device, self.dtype)
+                kd = t.as_tensor(np.ascontiguousarray(K[:, :T], np.float32)).to(self.device, self.dtype)
+                vd = t.as_tensor(np.ascontiguousarray(V[:, :T], np.float32)).to(self.device, self.dtype)
+                o = self._attend(qd.permute(1, 0, 2), kd, vd, m, T, H // KV)     # (H, m, hd)
+                out[:] = o.permute(1, 0, 2).float().cpu().numpy()
+        except RuntimeError as exc:
+            self.failed = f"attention: {exc}"
+            return False
+        self.calls += 1
+        self.rows += m
+        self.busy_s += time.perf_counter() - t0
+        return True
+
+    def _attend(self, q, k, v, m: int, T: int, g: int):
+        t = self.torch
+        if self._sdpa is None:
+            self._sdpa = False
+            try:
+                from torch.nn.attention.bias import causal_lower_right
+                if self.device.type in ("cuda", "cpu"):
+                    self._sdpa = causal_lower_right
+            except ImportError:
+                pass
+        if self._sdpa:
+            try:   # queries are the last m of T positions: a lower-right causal mask
+                kk, vv = k.repeat_interleave(g, 0), v.repeat_interleave(g, 0)
+                o = t.nn.functional.scaled_dot_product_attention(q[None], kk[None], vv[None],
+                                                                 attn_mask=self._sdpa(m, T))
+                return o[0]
+            except RuntimeError:
+                self._sdpa = False
+        # Blocks of query rows, each against the keys up to its last row; the
+        # heads that share a key/value head are one matrix product.
+        KV, hd = k.shape[0], k.shape[2]
+        out = t.empty((KV * g, m, hd), dtype=q.dtype, device=q.device)
+        qg = (q * hd ** -0.5).reshape(KV, g, m, hd)     # scaled first: fp16 scores stay small
+        og = out.view(KV, g, m, hd)
+        step = max(16, self.SCORES // (KV * g * T))
+        for r0 in range(0, m, step):
+            r1 = min(m, r0 + step)
+            mb, end = r1 - r0, T - m + r1
+            s = t.matmul(qg[:, :, r0:r1].reshape(KV, g * mb, hd), k[:, :end].transpose(1, 2)).float()
+            future = t.arange(end, device=s.device)[None, :] > (T - m + t.arange(r0, r1, device=s.device))[:, None]
+            s = s.view(KV, g, mb, end).masked_fill(future, float("-inf"))
+            p = t.softmax(s, dim=-1).to(v.dtype).view(KV, g * mb, end)
+            og[:, :, r0:r1] = t.matmul(p, v[:, :end]).view(KV, g, mb, hd)
+        return out
+
+    def calibrate(self, heads: int, kv_heads: int, head_dim: int, cpu_attention, rows: int = 512,
+                  keys: int = 4096) -> float:
+        """Time one prompt pass's attention block on each device; returns how
+        many times faster the GPU is."""
+        rng = np.random.default_rng(0)
+        q = rng.standard_normal((rows, heads, head_dim)).astype(np.float32)
+        K = rng.standard_normal((kv_heads, keys, head_dim)).astype(np.float32)
+        V = rng.standard_normal((kv_heads, keys, head_dim)).astype(np.float32)
+        pos = np.arange(keys - rows, keys)
+        out = np.empty_like(q)
+
+        def best(f, n=3):
+            f()
+            ts = []
+            for _ in range(n):
+                t0 = time.perf_counter()
+                f()
+                ts.append(time.perf_counter() - t0)
+            return min(ts) * 1000
+        ok = []
+        self.gpu_ms = best(lambda: ok.append(self.attention(q, K, V, pos, out)))
+        self.cpu_ms = best(lambda: cpu_attention(q, K, V, pos, out))
+        self.calls = self.rows = 0
+        self.busy_s = 0.0
+        if not all(ok):
+            return 0.0
+        return self.cpu_ms / self.gpu_ms
+
+    def stats(self) -> dict:
+        return {"device": self.name, "attention_calls": self.calls, "rows": self.rows,
+                "busy_s": round(self.busy_s, 3), "weights_bytes": self.used,
+                "gpu_ms": self.gpu_ms, "cpu_ms": self.cpu_ms, "failed": self.failed}
+
+
 def bench_gpu(spec: str, budget: int, hidden: int, inter: int, fmt: str, gs: int = 64) -> dict:
     """GPU side of a node's speed benchmark: ms per expert on the GPU (one input
     row, transfers included) and how many experts fit in ``budget``. Raises

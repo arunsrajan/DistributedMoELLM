@@ -621,6 +621,45 @@ Beyond that the CPU's memory bandwidth limits attention (parallel BLAS and
 `exp` passes scale only 3x on 6 cores), so the cache is what makes agents
 usable: the system prompt is read once, not every turn or every restart.
 
+### Reading prompts on a GPU
+
+```bash
+# on the machine with the GPU (it needs the model file); the other machine runs a worker
+python -m moelan serve --model Qwen3-Coder-30B-A3B-Instruct-Q2_K.gguf --workers 192.168.1.4:9100 --gpu cuda --gpu-budget 0
+```
+
+The first read of a long prompt is mostly attention on the coordinator, and
+it grows with the square of the prompt's length. Measured on a two-laptop
+cluster reading an 18,169-token agent prompt (about 21 minutes in all): in
+the second 8,192-token pass a layer took 13.9 s, 78% of it the coordinator's
+attention and its projections and 22% waiting for the workers' experts.
+
+That is dense matrix work, which GPUs are built for. So with `--gpu` on
+`serve` (or `run`), a prompt pass of 32 rows or more runs its attention on the
+GPU: the q/k/v/o projections and the score/value step. Generating stays on
+the CPU, since one row at a time is where a laptop GPU made layers slower
+(see below).
+
+* The projection weights are uploaded once, in fp16, on first use: about
+  1.8 GB for Qwen3-30B. `--gpu-budget 0` keeps the card free of experts for
+  them.
+* On CUDA the score/value step is PyTorch's fused attention with a causal
+  mask for a pass that continues earlier tokens. Elsewhere it runs in blocks of
+  query rows.
+* At start-up both devices time one 512-row attention block. `--gpu-mode
+  auto` uses the GPU only if it is at least 1.5x faster; `max` uses it
+  regardless.
+* A weight that does not fit, or a step that fails (out of memory, say),
+  falls back to the CPU, and `/api/status` shows why under
+  `model.prompt_gpu.failed`.
+* Models with DeepSeek's MLA attention keep it on the CPU.
+
+On this laptop's integrated Radeon (DirectML) the start-up check measured
+391 ms for the block against 441 ms on the CPU (1.13x), so `auto` leaves it
+out. Its fp16 results differed from the CPU's by at most 0.4%. An RTX 4050 has
+not been measured here yet. For an 18k-token prompt the attention part should
+drop from minutes to seconds, leaving mostly the experts' time.
+
 ### Hybrid CPU + GPU experts
 
 ```bash
