@@ -246,5 +246,6 @@ def test_worker_reports_its_disk_and_cli_takes_the_modes(tiny, tmp_path, monkeyp
     seen = {}
     import moelan.worker as worker_mod
     monkeypatch.setattr(worker_mod, "serve", lambda **kw: seen.update(kw))
-    main(["worker", "--disk", "200G", "--no-advertise"])
+    # --port 0: a real worker may hold the default port on this machine
+    main(["worker", "--port", "0", "--disk", "200G", "--no-advertise"])
     assert seen["disk_budget"] == 200 * 2**30

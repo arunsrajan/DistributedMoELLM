@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -552,6 +553,9 @@ class ExpertStore:
         self.map_size = map_size
         self.gpu = None       # accel.GpuTier when a GPU holds some of this node's experts
         self.gpu_info = None  # its stats, also when calibration decided not to use it
+        self.gpu_guard = None # accel.GpuGuard: checks in real use that the GPU helps (--gpu-mode auto)
+        self.gpu_event = None # gpu_info once the guard dropped the GPU, until a worker reports it
+        self._gpu_say = None
         self.hits = 0
         self.misses = 0       # experts computed from the memory-mapped source (SSD or page cache)
         self._lock = threading.Lock()
@@ -648,17 +652,57 @@ class ExpertStore:
 
         groups = list(groups)
         out = np.zeros_like(x, dtype=np.float32)
-        handle = None
-        if self.gpu is not None and self.gpu.experts:
-            on_gpu = [g for g in groups if (layer, int(g[0])) in self.gpu]
-            if on_gpu:   # queue the GPU's share first; the CPU computes the rest meanwhile
-                handle = self.gpu.launch(layer, x, on_gpu)
-                groups = [g for g in groups if (layer, int(g[0])) not in self.gpu]
-                self.hits += len(on_gpu)
+        handle, arm, gpu = None, "on", self.gpu
+        t0 = time.perf_counter()
+        if gpu is not None and gpu.experts and any((layer, int(g[0])) in gpu for g in groups):
+            guard = self.gpu_guard
+            if guard is not None:   # now and then this layer runs on the CPU alone, to compare
+                arm = guard.choose(len(x))
+            if arm != "cpu":        # queue the GPU's share first; the CPU computes the rest meanwhile
+                n = len(groups)
+                handle, groups = gpu.launch_held(layer, x, groups)
+                self.hits += n - len(groups)
         self._compute_cpu(layer, x, groups, out, one)
         if handle is not None:
-            self.gpu.collect(handle, out)
+            gpu.collect(handle, out)
+        if arm != "on":
+            self._judge_gpu(gpu, arm, time.perf_counter() - t0)
         return out
+
+    def _judge_gpu(self, gpu, arm: str, seconds: float) -> None:
+        guard = self.gpu_guard
+        verdict = guard.record(arm, seconds) if guard is not None else None
+        if verdict is None:
+            return
+        keep, g, c = verdict
+        say = self._gpu_say
+        if keep:
+            if say and guard.checks == 1:
+                say(f"{gpu.name}: generating, a layer takes {g:.2f} ms with the GPU vs {c:.2f} ms "
+                    f"on the CPU alone -> GPU kept")
+            return
+        with self._lock:
+            if self.gpu is not gpu:
+                return
+            self.gpu, self.gpu_guard = None, None
+        n = len(gpu.experts)
+        info = dict(gpu.stats(), experts=0, used_bytes=0, share=0.0, **guard.stats(),
+                    dropped=f"generating, a layer took {g:.2f} ms with the GPU vs {c:.2f} ms on the "
+                            f"CPU alone")
+        gpu.release()
+        self.gpu_info = self.gpu_event = info
+        if say:
+            say(f"{gpu.name}: generating, a layer took {g:.2f} ms with the GPU vs {c:.2f} ms on the "
+                f"CPU alone -> GPU dropped, its {n} experts are computed on the CPU from now on "
+                f"(--gpu-mode max keeps a GPU regardless)")
+
+    def gpu_stats(self) -> dict | None:
+        """The GPU's stats with the real-use comparison; after the GPU was
+        dropped or declined, why."""
+        gpu, guard = self.gpu, self.gpu_guard
+        if gpu is None:
+            return self.gpu_info
+        return dict(gpu.stats(), **guard.stats()) if guard is not None else gpu.stats()
 
     def _compute_cpu(self, layer, x, groups, out, one) -> None:
         if not kernels.ENABLED:
@@ -713,8 +757,9 @@ class ExpertStore:
         """Put some of ``candidates`` (this node's experts) on a GPU. ``auto``
         measures both devices and gives the GPU the hottest experts up to its
         fair share of the routed work; ``max`` fills the budget hottest-first."""
-        from .accel import GpuTier, choose_gpu_experts
+        from .accel import GpuGuard, GpuTier, choose_gpu_experts
         candidates = [tuple(k) for k in candidates]
+        self.gpu_guard, self.gpu_event, self._gpu_say = None, None, progress
         if not candidates or budget <= 0:
             return {}
         tier = GpuTier(spec, budget)
@@ -744,6 +789,7 @@ class ExpertStore:
             progress(f"{tier.name}: {tier.gpu_ms:.2f} ms per expert vs CPU {tier.cpu_ms:.2f} ms -> "
                      f"GPU share {share:.0%}; {placed} experts on the GPU "
                      f"({tier.used / 2**30:.2f} of {budget / 2**30:.2f} GiB)")
+        self.gpu_guard = GpuGuard() if mode == "auto" and placed else None
         self.gpu = tier if placed else None
         self.gpu_info = tier.stats()
         return self.gpu_info

@@ -84,7 +84,8 @@ that already fits.
   streams) and a **prompt cache** that reuses the shared start of a
   conversation.
 * **Hybrid CPU + GPU experts** (`--gpu cuda|mps|dml|auto`): each node can put
-  its hottest experts on a GPU and compute them alongside the CPU.
+  its hottest experts on a GPU and compute them alongside the CPU, and drops
+  a GPU that turns out to make layers slower in real use.
 * **Monitoring dashboard** at `http://<host>:<port>/` of `moelan serve` (see
   below), and `moelan monitor` for watching workers without loading a model.
 * **Safe wire format.** JSON header + raw numpy bytes; no pickle.
@@ -618,6 +619,31 @@ layer's experts, it is not used at all. `--gpu-mode max` fills the budget
 regardless. The coordinator sends each worker the routing heat of its
 experts, so workers pick their own hot set. The dashboard's node table shows
 each node's GPU, its experts, memory and measured speed.
+
+That start-up timing is one expert at a time in a tight loop, and real use
+can be very different. On a worker with a laptop RTX 4050 it measured 0.46 ms
+per expert against 0.36 ms on the CPU, so the GPU got 43% of the work; but
+while generating, layers that touched the GPU took 7.7 ms against 2.3 ms for
+layers on the CPU alone. Real requests arrive after a wait for the network,
+the CPU's kernels hold every core while the GPU's share runs, and each launch
+pays for transfers and a synchronisation. So `auto` also checks while
+generating:
+
+* A random quarter of the layers that would use the GPU are computed on the
+  CPU alone, and every such layer is timed, as are the layers that used the
+  GPU meanwhile.
+* After 32 layers of each kind their median times are compared. A GPU that
+  is not faster is dropped: its memory is freed and its experts are computed
+  on the CPU from then on. The log says so, with both times, and the
+  dashboard's node table shows "dropped, slower than its CPU". A GPU that is
+  faster is checked again every 4096 layers, as a laptop GPU can slow down
+  once it heats up.
+* Only layers of up to 16 rows (generating) are compared. Reading a prompt
+  uses the GPU for as long as it is kept.
+* A worker remembers a dropped GPU until it restarts. The next `serve` gets
+  the worker's benchmark without the GPU, so `--placement speed` plans for
+  its CPU alone. Restart the worker to try the GPU again.
+* `--gpu-mode max` never drops the GPU.
 
 Measured on this laptop's integrated Radeon (DirectML, Qwen3-Coder-30B): the
 GPU needs 7.6 ms per expert against 0.48 ms on the CPU, so `auto` declines

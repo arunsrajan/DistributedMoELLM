@@ -168,7 +168,7 @@ def node_stats(model: MoEModel) -> list[dict]:
     st = b.store
     return [{"node": "local", "address": "-", "alive": True, "experts": len(st.pinned),
              "hits": st.hits, "disk_reads": st.misses, "resident_bytes": st.resident_bytes(),
-             "gpu": st.gpu.stats() if st.gpu else st.gpu_info}]
+             "gpu": st.gpu_stats()}]
 
 
 def heat_payload(model: MoEModel) -> dict:

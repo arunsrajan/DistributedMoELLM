@@ -13,11 +13,19 @@ until it is expected to carry its fair share of the routed work, so that
 both devices finish a layer at about the same time. A fast discrete GPU ends
 up taking as much as its memory budget allows; a slow integrated one only a
 small hot set, or nothing.
+
+That start-up timing is one expert at a time in a tight loop, which real use
+is not: a layer's request arrives after a wait for the network or the
+coordinator, the CPU's kernels hold every core while the GPU's share runs, and
+each launch pays transfers and a synchronisation. So in ``auto`` mode
+:class:`GpuGuard` also times real layers with and without the GPU while the
+node generates, and drops a GPU that does not make them faster.
 """
 
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 
@@ -74,7 +82,7 @@ class GpuTier:
         self.budget = int(budget_bytes)
         self.experts: dict = {}            # (layer, expert) -> (gate_up, down) on the device
         self.used = 0
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.calls = 0
         self.busy_s = 0.0
         self.share = 0.0                   # target share of routed work, from calibration
@@ -119,6 +127,23 @@ class GpuTier:
             self.calls += 1
         return out, t0
 
+    def launch_held(self, layer: int, x: np.ndarray, groups):
+        """Launch those of ``groups`` whose experts this GPU holds; returns
+        (handle or None, the other groups). Atomic with :meth:`release`."""
+        with self.lock:
+            on = [g for g in groups if (layer, int(g[0])) in self.experts]
+            if not on:
+                return None, groups
+            return self.launch(layer, x, on), [g for g in groups if (layer, int(g[0])) not in self.experts]
+
+    def release(self) -> None:
+        """Free the GPU's memory; its experts are computed on the CPU from now on."""
+        with self.lock:
+            self.experts.clear()
+            self.used = 0
+        if getattr(self.device, "type", "") == "cuda":
+            self.torch.cuda.empty_cache()
+
     def collect(self, handle, out: np.ndarray) -> None:
         parts, t0 = handle
         for rows, y in parts:
@@ -161,6 +186,66 @@ class GpuTier:
                 "budget_bytes": self.budget, "share": round(self.share, 3),
                 "gpu_ms_per_expert": self.gpu_ms, "cpu_ms_per_expert": self.cpu_ms,
                 "calls": self.calls, "busy_s": round(self.busy_s, 3)}
+
+
+class GpuGuard:
+    """Checks, while a node generates, that its GPU makes layers faster.
+
+    A random ``cpu_share`` of the layers that would use the GPU are computed
+    on the CPU alone instead, and every such layer is timed, as is each layer
+    that used the GPU meanwhile. Once both kinds have ``samples`` timings their
+    medians are compared: a GPU that is not faster gets dropped (the caller
+    frees it); one that is faster is compared again after ``recheck`` more
+    layers, as a laptop GPU that heats up can turn slow later.
+
+    Only layers of at most ``ROWS`` rows are compared, the size of generating
+    tokens; longer ones (reading a prompt) use the GPU while it is kept."""
+
+    ROWS = 16
+
+    def __init__(self, samples: int = 32, cpu_share: float = 0.25, recheck: int = 4096, seed: int = 0):
+        self.samples, self.cpu_share, self.recheck = samples, cpu_share, recheck
+        self.rng = random.Random(seed)
+        self.lock = threading.Lock()
+        self.times: dict[str, list] = {"gpu": [], "cpu": []}
+        self.wait = 0            # layers that use the GPU untimed before the next comparison
+        self.checks = 0
+        self.last = None         # (ms with the GPU, ms on the CPU alone) of the last comparison
+
+    def choose(self, rows: int) -> str:
+        """For a layer that would use the GPU: "on" (use it, untimed), "gpu"
+        (use it and time the layer) or "cpu" (compute it on the CPU alone, timed)."""
+        if rows > self.ROWS:
+            return "on"
+        with self.lock:
+            if self.wait > 0:
+                self.wait -= 1
+                return "on"
+            return "cpu" if self.rng.random() < self.cpu_share else "gpu"
+
+    def record(self, arm: str, seconds: float):
+        """One timed layer. Returns None until a comparison is due, then
+        (keep the GPU?, median ms with it, median ms on the CPU alone)."""
+        if arm not in self.times:
+            return None
+        with self.lock:
+            self.times[arm].append(seconds)
+            if min(len(v) for v in self.times.values()) < self.samples:
+                return None
+            g = float(np.median(self.times["gpu"])) * 1000
+            c = float(np.median(self.times["cpu"])) * 1000
+            self.times = {"gpu": [], "cpu": []}
+            self.checks += 1
+            self.last = (g, c)
+            keep = g < c
+            if keep:
+                self.wait = self.recheck
+            return keep, g, c
+
+    def stats(self) -> dict:
+        g, c = self.last or (None, None)
+        return {"checks": self.checks, "layer_ms_with_gpu": None if g is None else round(g, 3),
+                "layer_ms_cpu_alone": None if c is None else round(c, 3)}
 
 
 def bench_gpu(spec: str, budget: int, hidden: int, inter: int, fmt: str, gs: int = 64) -> dict:

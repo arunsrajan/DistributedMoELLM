@@ -146,6 +146,12 @@ class WorkerState:
     def cache_dir(self, fp: str) -> Path:
         return self.cache_root / fp
 
+    def gpu_dropped(self) -> str | None:
+        """Why this machine's GPU was dropped in real use, if it was: then the
+        worker leaves it out of later benchmarks and plans, until it restarts."""
+        return next((s.gpu_info["dropped"] for s in self.stores.values()
+                     if (s.gpu_info or {}).get("dropped")), None)
+
     def store_for(self, fp: str, cfg_raw: dict | None, meta: dict | None, fmt: str) -> ExpertStore:
         with self.lock:
             st = self.stores.get(fp)
@@ -264,7 +270,11 @@ class _Handler(socketserver.BaseRequestHandler):
         if op == "bench":    # ms per expert on this machine, before it holds any experts
             from .experts import bench_expert
             out = {"ok": True, "ms": bench_expert(h["hidden"], h["inter"], h["format"], h.get("gs", 64))}
-            if st.gpu:       # and on its GPU, so placement counts the GPU too
+            dropped = st.gpu_dropped() if st.gpu else None
+            if dropped:      # it made layers slower in real use: placement must not count it
+                out["gpu_error"] = (f"slower than the CPU in real use ({dropped}); "
+                                    "restart the worker to try the GPU again")
+            elif st.gpu:     # and on its GPU, so placement counts the GPU too
                 from .accel import bench_gpu
                 try:
                     out.update(bench_gpu(st.gpu, st.gpu_budget, h["hidden"], h["inter"], h["format"],
@@ -313,12 +323,12 @@ class _Handler(socketserver.BaseRequestHandler):
             t0 = time.perf_counter()
             store.pin(ram)
             gpu = {}
-            if st.gpu and store.gpu is None:   # hybrid: hottest assigned experts to the GPU
-                heat = dict(zip(keys, st.heat.get(fp, [])))
+            if st.gpu and store.gpu is None and not st.gpu_dropped():
+                heat = dict(zip(keys, st.heat.get(fp, [])))   # hybrid: hottest assigned experts to the GPU
                 gpu = store.setup_gpu(st.gpu, st.gpu_budget, keys, heat=heat, mode=st.gpu_mode,
                                       progress=log.info)
             elif store.gpu_info is not None:
-                gpu = store.gpu.stats() if store.gpu else store.gpu_info
+                gpu = store.gpu_stats()
             held = len(set(keys) | set(extra))
             return {"ok": True, "resident_bytes": store.resident_bytes(),
                     "load_s": time.perf_counter() - t0, "gpu": gpu,
@@ -337,7 +347,10 @@ class _Handler(socketserver.BaseRequestHandler):
             dt = time.perf_counter() - t0
             st.requests += 1
             st.busy_s += dt
-            return ({"ok": True, "compute_s": dt, "ssd_reads": store.misses},
+            reply = {"ok": True, "compute_s": dt, "ssd_reads": store.misses}
+            if store.gpu_event is not None:   # the GPU was just dropped: tell the coordinator once
+                reply["gpu"], store.gpu_event = store.gpu_event, None
+            return (reply,
                     dict(encode_rows(y[touched], h.get("wire", "f32"), "y"), rows=touched.astype(np.int32)))
         if op == "stats":
             return {"ok": True, "requests": st.requests, "busy_s": st.busy_s,
@@ -346,7 +359,7 @@ class _Handler(socketserver.BaseRequestHandler):
                                     "ssd_experts": len(set(st.assigned.get(fp, [])) | set(st.extra.get(fp, [])))
                                     - len(s.pinned)}
                                for fp, s in st.stores.items()},
-                    "gpu": {fp: s.gpu.stats() for fp, s in st.stores.items() if s.gpu}}, None
+                    "gpu": {fp: s.gpu_stats() for fp, s in st.stores.items() if s.gpu_stats()}}, None
         raise ValueError(f"unknown op {op!r}")
 
 

@@ -297,6 +297,16 @@ function gpuNote(sp) {   // a GPU that counted in the speed placement
     : ` (GPU too slow to help)`;
 }
 
+function gpuCell(g) {    // a node's GPU: its experts, or why it holds none
+  if (!g) return el("td", {}, "–");
+  let title = `${fmt(g.gpu_ms_per_expert, 2)} ms per expert on the GPU vs ${fmt(g.cpu_ms_per_expert, 2)} ms on the CPU`;
+  if (g.layer_ms_with_gpu != null)
+    title += `; generating, a layer takes ${fmt(g.layer_ms_with_gpu, 2)} ms with the GPU vs ${fmt(g.layer_ms_cpu_alone, 2)} ms on the CPU alone`;
+  if (g.dropped) return el("td", { title: g.dropped }, `${g.device}: dropped, slower than its CPU`);
+  return el("td", { title }, g.experts
+    ? `${g.device} · ${int(g.experts)} experts · ${gib(g.used_bytes)}` : `${g.device}: not used`);
+}
+
 function renderNodes(nodes) {
   const t = $("nodes");
   if (!nodes.length) { t.replaceChildren(el("tr", {}, el("td", { class: "empty" }, "No nodes yet."))); return; }
@@ -334,8 +344,7 @@ function renderNodes(nodes) {
             : `not used: round trip ${fmt(n.speed.rtt_ms, 1)} ms costs more than it saves`),
       el("td", {}, ram),
       el("td", { class: "num" }, n.cpus ?? "–"),
-      el("td", { title: n.gpu ? `${fmt(n.gpu.gpu_ms_per_expert, 2)} ms per expert on the GPU vs ${fmt(n.gpu.cpu_ms_per_expert, 2)} ms on the CPU` : "" },
-        n.gpu && n.gpu.experts ? `${n.gpu.device} · ${int(n.gpu.experts)} experts · ${gib(n.gpu.used_bytes)}` : (n.gpu ? `${n.gpu.device}: not used` : "–")),
+      gpuCell(n.gpu),
       el("td", { class: "num" }, n.requests != null ? int(n.requests) : "–"),
       el("td", { class: "num" }, n.mib_out != null ? fmt(n.mib_out, 1) : "–"),
       el("td", { class: "num" }, n.compute_s != null ? fmt(n.compute_s, 2) : "–"),

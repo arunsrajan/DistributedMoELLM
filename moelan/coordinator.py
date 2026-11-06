@@ -418,6 +418,15 @@ class DistributedBackend(ExpertBackend):
             self.progress(f"{c.node_id}: {c.ram_experts} experts resident "
                           f"({h['resident_bytes'] / 2**30:.2f} GiB, loaded in {h['load_s']:.1f}s)")
 
+    def _gpu_dropped(self, c: WorkerConn, info: dict) -> None:
+        """A worker's GPU made its layers slower in real use and was dropped."""
+        c.gpu = info
+        node = self.speed.get("nodes", {}).get(c.node_id) if self.speed else None
+        replan = (" Speed placement counted that GPU: restart serve to place experts for its CPU "
+                  "alone (the worker remembers)." if node and node.get("gpu") else "")
+        self.progress(f"{c.node_id}: {info.get('device', 'GPU')} dropped ({info.get('dropped')}); "
+                      f"its experts are computed on its CPU from now on.{replan}")
+
     def _setup_all(self) -> None:
         conns = list(self.conns.values())
         if conns:
@@ -515,6 +524,8 @@ class DistributedBackend(ExpertBackend):
                     h, arrays = c.recv()
                     c.remote_s += h.get("compute_s", 0.0)
                     c.ssd_reads = h.get("ssd_reads", c.ssd_reads)
+                    if h.get("gpu"):
+                        self._gpu_dropped(c, h["gpu"])
                     c.bytes_in += sum(a.nbytes for a in arrays.values())
                     out[uniq[arrays["rows"]]] += decode_rows(arrays, "y")
                 except (OSError, RuntimeError, ConnectionError) as exc:
@@ -545,7 +556,7 @@ class DistributedBackend(ExpertBackend):
                     "ram_experts": len(self.local.pinned), "ssd_experts": max(0, mine - len(self.local.pinned)),
                     "disk_reads": self.local.misses, "hits": self.local.hits,
                     "resident_bytes": self.local.resident_bytes(),
-                    "gpu": self.local.gpu.stats() if self.local.gpu else self.local.gpu_info,
+                    "gpu": self.local.gpu_stats(),
                     "speed": ({"expert_ms": self.speed["local_ms"], "cpu_ms": self.speed.get("local_cpu_ms"),
                                "gpu": self.speed.get("local_gpu"), "share": 1.0 - sum(
                         n["share"] for n in self.speed["nodes"].values()),
